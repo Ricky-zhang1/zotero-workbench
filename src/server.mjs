@@ -651,9 +651,52 @@ const collaborationWorkspace = new CollaborationWorkspace({
 register('research_materials','我的标注与笔记','读取指定分类或文献的高亮、批注和子笔记。仅作为研究者选择的写作语料；续页保留 scopeId。',{
  library:librarySchema,keys:z.array(keySchema).max(500).optional(),collection:keySchema.optional(),recursive:z.boolean().default(true),scopeId:z.string().optional(),offset:z.number().int().min(0).default(0),limit:z.number().int().min(1).max(10).default(5)
 },args=>researchWorkspace.materials(args));
-register('start_research_job','一键全文折叠或标注写作','点击后自动读取材料并调用本机已登录 Codex 的模型。fold 必须完整处理全文；draft 只使用研究者勾选的标注，不再反向寻找文段补高亮。返回任务 id，使用 research_job 查询结果。会产生模型调用费用/额度消耗，只写本机派生结果，不写 Zotero。',{
- kind:z.enum(['fold','draft']),library:librarySchema,key:keySchema.optional(),keys:z.array(keySchema).max(50).optional(),sourceIds:z.array(z.string()).max(200).optional(),sourceVersions:z.record(z.string(),z.string()).optional(),purpose:z.enum(['paragraph','review']).default('paragraph'),framework:z.string().max(12000).default('')
-},args=>researchWorkspace.start(args),{readOnly:false});
+const researchSourceIdSchema = z.string().regex(/^[a-f0-9]{16}$/);
+const researchFingerprintSchema = z.string().regex(/^[a-f0-9]{64}$/);
+const startResearchJobSchema = z.object({
+ kind:z.enum(['fold','draft','translate','translate_annotations']),
+ library:librarySchema,
+ key:keySchema.optional(),
+ keys:z.array(keySchema).max(50).optional(),
+ sourceIds:z.array(researchSourceIdSchema).max(200).optional(),
+ sourceVersions:z.record(z.string(),researchFingerprintSchema).optional(),
+ purpose:z.enum(['paragraph','review']).optional(),
+ framework:z.string().max(12000).optional()
+}).superRefine((args,ctx)=>{
+ const issue=(path,message)=>ctx.addIssue({code:'custom',path,message});
+ const unique=(items)=>new Set(items).size===items.length;
+ const exactVersions=(ids)=>{
+  if(!args.sourceVersions||Object.keys(args.sourceVersions).length!==ids.length||
+    ids.some(id=>!Object.hasOwn(args.sourceVersions,id)))
+   issue(['sourceVersions'],'sourceVersions 必须为每个所选来源提供且仅提供当前指纹。');
+ };
+ if(args.kind==='fold'||args.kind==='translate'){
+  if(!args.key)issue(['key'],`${args.kind} 必须指定单篇文献 key。`);
+  if(args.keys!==undefined||args.sourceIds!==undefined||args.sourceVersions!==undefined)
+   issue(['keys'],'全文任务不能混入批注来源参数。');
+  if(args.kind==='translate'&&(args.purpose!==undefined||args.framework!==undefined))
+   issue(['purpose'],'全文翻译不接受写作 purpose 或 framework。');
+  return;
+ }
+ if(args.kind==='draft'){
+  if(args.key!==undefined)issue(['key'],'draft 应使用研究者所选的 keys。');
+  if(!args.keys?.length)issue(['keys'],'draft 至少需要一篇明确选择的文献。');
+  if(args.keys&&!unique(args.keys))issue(['keys'],'keys 不能重复。');
+  if(!args.sourceIds?.length)issue(['sourceIds'],'draft 至少需要一个明确选择的来源。');
+  if(args.sourceIds&&!unique(args.sourceIds))issue(['sourceIds'],'sourceIds 不能重复。');
+  if(args.sourceIds)exactVersions(args.sourceIds);
+  return;
+ }
+ if(args.key!==undefined)issue(['key'],'批注翻译应使用 keys。');
+ if(args.purpose!==undefined||args.framework!==undefined)
+  issue(['purpose'],'批注翻译不接受写作 purpose 或 framework。');
+ if(!args.keys?.length||args.keys.length>20)issue(['keys'],'批注翻译需指定 1–20 篇文献。');
+ if(args.keys&&!unique(args.keys))issue(['keys'],'keys 不能重复。');
+ if(!args.sourceIds?.length||args.sourceIds.length>20)issue(['sourceIds'],'批注翻译单批最多 20 条来源。');
+ if(args.sourceIds&&!unique(args.sourceIds))issue(['sourceIds'],'sourceIds 不能重复。');
+ if(args.sourceIds)exactVersions(args.sourceIds);
+});
+register('start_research_job','全文阅读、翻译或标注写作','按 kind 执行本机研究任务：fold 完整阅读单篇 PDF 并生成 TextFold 五层与研究导读；translate 生成单篇全文中文对照；translate_annotations 只翻译服务端核验的外文 highlight/underline，单批最多 20 条；draft 只使用研究者勾选的标注。任务调用本机已配置的 Codex CLI，结果仅保存为本机派生材料，不写 Zotero。返回任务 id，使用 research_job 查询结果。',startResearchJobSchema,args=>researchWorkspace.start(args),{readOnly:false});
 register('research_job','读取研究任务','读取进度、完整的 TextFold 五层结果或带材料回链的初稿。失败/中断不能视为完成。',{id:z.string().regex(/^[a-f0-9]{24}$/)},args=>researchWorkspace.status(args.id));
 register('cancel_research_job','取消研究任务','停止本宿主启动的后台 AI 任务，不删除 Zotero 内容。',{id:z.string().regex(/^[a-f0-9]{24}$/)},args=>researchWorkspace.cancel(args.id),{readOnly:false});
 

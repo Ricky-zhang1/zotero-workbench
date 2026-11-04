@@ -31,7 +31,7 @@ description: 打开和使用 Codex 内的 Zotero 文库及 PDF 阅读器；按�
 
 ## 操作边界
 
-用户点击面板“提问”“核查引用”等按钮时，才向当前对话提交该任务。普通浏览不自动发送论文内容。写入 Zotero、修改稿件和导入文献仍按用户当前授权执行。
+用户点击面板“提问”“核查引用”等按钮时，才向当前对话提交该任务。文库与 PDF 阅读器的普通浏览不会自动向当前对话发送论文内容，也不启动阅读模型；研究页的自动对照和生成任务按下文范围执行。写入 Zotero、修改稿件和导入文献仍按用户当前授权执行。
 
 真正的阅读记录放研究项目既有目录，不能写到插件目录。只读查询不产生个人长期记忆或日记。工作台的导航状态仅保留在该 MCP 进程中，关闭进程后不保证恢复。
 
@@ -73,8 +73,11 @@ description: 打开和使用 Codex 内的 Zotero 文库及 PDF 阅读器；按�
 - `research_materials` 按 keys 或 collection（含子分类）分页读取高亮、评论、子笔记。必须保留 scopeId，读到 nextOffset=null；errors/incomplete 不可当成全量成功。
 - 只有用户明确选定的材料才进入写作。`start_research_job(kind="draft")` 传文献 keys、sourceIds 与 sourceVersions（每条 fingerprint），用途 purpose 与可选 framework。生成前重读所选记录；变化时要求刷新。不能把 AI TextFold 概括自动加入人工所选语料。
 - `start_research_job(kind="fold")` 传单篇 library/key，自动调用本机 Codex CLI 的现有模型配置读取完整可提取 PDF，再用 TextFold 生成五层。topic/takeaway/key 为 AI 概括；brief/full 为来源原句/全文。不能将有页缺失、扫描文字不可读或模型降级的结果称为完成。
+- `start_research_job(kind="translate")` 生成单篇 PDF 的中文对照译文；`kind="translate_annotations"` 只处理服务端重读确认的外文 highlight/underline 来源，单批最多 20 条。译文保留原文、文献 key、PDF/页码或 annotation 来源身份，作为本机派生辅助，不改写 Zotero。
+- TextFold 的 `researchGuide` 与自动译文都属于 AI 派生辅助；原文身份保持不变。不得把译文、导读或其概括自动当作 `humanSelected` 写作语料。逐字引文仍须回到原文核对，并使用现有 `register_citation` 登记。
 - `research_job` 查询进度/结果；`cancel_research_job` 停止当前宿主中的任务。只有 completed 才能交付生成结果，段落附 sources 为材料回链，不是语义正确性证明。
-- 点击生成即发送本次材料到用户已配置的模型，消耗该模型额度；不需要再在聊天中指定。普通浏览不启动模型。不写 Zotero。派生结果保存到本机 research 私有缓存；缓存包含所选材料及生成稿，应按研究资料管理。
+- 研究页默认开启标注对照：对研究者明确选择且已加载到当前范围内的外文高亮/下划线，按批调用已配置的阅读模型生成中文对照；可在研究页关闭。阅读者备注与独立笔记不会自动翻译。
+- 全文翻译与 TextFold 由研究者点击对应生成按钮后启动；点击生成会把本次任务范围内的材料发送到已配置模型并消耗其额度，无需再在聊天中指定模型。文库/PDF 普通浏览不启动模型。不写 Zotero。派生结果保存到本机 research 私有缓存；缓存包含所选材料及生成稿，应按研究资料管理。
 
 ## 当前会话协作（本轮实施）
 

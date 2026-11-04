@@ -11,8 +11,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Install optional TextFold extraction dependency
-        run: sudo apt-get update && sudo apt-get install -y poppler-utils
+      - name: Install optional TextFold test dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y poppler-utils
+          python3 -m pip install -r vendor/textfold/requirements-lock.txt
       - run: node scripts/build.mjs
-      - run: node --test tests/*.test.mjs
-      - run: python3 -m unittest discover -s tests -p 'package_portable_test.py'
+      - run: node --test --test-concurrency=1 tests/*.test.mjs
+      - run: node --test integrations/dsh/test/*.test.mjs
+      - run: python3 tests/research-worker.test.py
+      - run: python3 -m unittest discover -s tests -p package_portable_test.py

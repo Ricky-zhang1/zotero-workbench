@@ -1,8 +1,8 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "zotero-workbench",
-  "version": "1.1.0",
-  "description": "连接本机 Zotero 与已有 Zotero MCP，提供文库浏览、PDF 阅读、引用核查与导出；支持标注写作和 TextFold 五层阅读（需本机 Codex CLI 与研究运行环境）。",
+  "version": "1.2.0",
+  "description": "连接本机 Zotero，提供文库浏览、PDF 阅读、引用核查与标注写作；支持 TextFold 五层阅读与研究导读、全文和外文高亮中文对照。翻译使用本机已配置的 Codex CLI；TextFold 另需研究运行环境。",
   "author": {
     "name": "Zhang Ruizhe"
   },
@@ -11,8 +11,8 @@
     "com.openai": {
       "interface": {
         "displayName": "Zotero 文献工作台",
-        "shortDescription": "文库、标注写作与 TextFold 阅读",
-        "longDescription": "连接本机 Zotero 与已有 Zotero MCP，提供文库浏览、PDF 阅读、引用核查与导出；支持标注写作和 TextFold 五层阅读（需本机 Codex CLI 与研究运行环境）。",
+        "shortDescription": "文库、研究导读与中文对照",
+        "longDescription": "连接本机 Zotero，提供文库浏览、PDF 阅读、引用核查与标注写作；支持 TextFold 五层阅读与研究导读、全文和外文高亮中文对照。翻译使用本机已配置的 Codex CLI；TextFold 另需研究运行环境。",
         "developerName": "Zhang Ruizhe",
         "category": "Research",
         "capabilities": [

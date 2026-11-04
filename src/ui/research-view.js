@@ -7,7 +7,7 @@ const LEVELS = [
   ['full', '全文'],
 ];
 
-const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
+const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'interrupted', 'verification_required']);
 const ANNOTATION_KIND_LABELS = new Map([
   ['highlight', '高亮'],
   ['underline', '下划线'],
@@ -21,6 +21,20 @@ const UNIT_KIND_LABELS = new Map([
   ['caption', '图注'],
   ['abstract', '摘要'],
 ]);
+const GROUP_MODES = [
+  ['paper', '文献'],
+  ['color', '颜色'],
+  ['kind', '材料类型'],
+  ['researchType', '研究类型'],
+];
+const GUIDE_SECTIONS = [
+  ['researchQuestion', '研究问题'],
+  ['argument', '论证主线'],
+  ['concepts', '核心概念'],
+  ['methods', '方法与证据'],
+  ['findings', '发现与边界'],
+  ['limitations', '文献对话与迁移边界'],
+];
 
 function el(document, tag, className, text) {
   const element = document.createElement(tag);
@@ -77,13 +91,20 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
     total: null,
     selected: new Map(),
     view: 'annotations',
+    groupMode: 'paper',
+    autoTranslateAnnotations: true,
+    annotationTranslations: new Map(),
+    annotationTranslationStatuses: new Map(),
+    translationDisplay: 'parallel',
     purpose: 'paragraph',
     framework: '',
     job: null,
     result: null,
+    savedJobs: [],
     level: 'topic',
     openSources: new Set(),
     readError: '',
+    selectionRestoreNotice: '',
     copyMessage: '',
     showAllSelected: false,
     scopePickerOpen: false,
@@ -101,8 +122,26 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
   let jobEpoch = 0;
   let pollTimer = null;
   let recoveryStarted = false;
+  let recoverySettled = false;
+  let recoveryEpoch = 0;
+  let materialsReady = false;
   let scopeLookupEpoch = 0;
   let draftComposer = null;
+  let annotationTranslationEpoch = 0;
+  let annotationTranslationTimer = null;
+  let annotationTranslationWaitResolve = null;
+  let annotationTranslationJob = null;
+  let annotationTranslationStartingEpoch = null;
+  let annotationTranslationAttempts = new Set();
+  let annotationTranslationVerificationJobs = new Map();
+  let annotationTranslationVerificationBySource = new Map();
+  let annotationTranslationVerificationBusy = new Set();
+  let pendingReaderSelection = [];
+  const AUTO_TRANSLATE_SETTING = 'zoteroWorkbenchAutoTranslateAnnotations';
+  try {
+    const saved = document.defaultView.localStorage.getItem(AUTO_TRANSLATE_SETTING);
+    state.autoTranslateAnnotations = saved === null ? true : saved === 'true';
+  } catch { /* default to enabled when local settings cannot be read */ }
   function jobStorageKeyFor(scopeValue = activeScope) {
     const normalizedKeys = Array.isArray(scopeValue?.keys) ? unique(scopeValue.keys).sort() : null;
     const scopeSignature = stableHash(JSON.stringify({
@@ -113,6 +152,92 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
     }));
     return `zotero-workbench-research-jobs:${library}:${scopeSignature}`;
   }
+
+  function readSavedJobReferences(scopeValue = activeScope) {
+    try {
+      const references = JSON.parse(document.defaultView.localStorage.getItem(jobStorageKeyFor(scopeValue)) || '[]');
+      return Array.isArray(references) ? references.filter(reference => reference?.id && reference.library === library
+        && ['fold', 'draft', 'translate'].includes(reference.kind))
+        .sort((left, right) => (right.updatedAt || 0) - (left.updatedAt || 0)) : [];
+    } catch { return []; }
+  }
+
+  function readerStateStorageKey(scopeValue = activeScope) {
+    return `${jobStorageKeyFor(scopeValue)}:reader-state`;
+  }
+
+  function readReaderState(scopeValue = activeScope) {
+    try {
+      const saved = JSON.parse(document.defaultView.localStorage.getItem(readerStateStorageKey(scopeValue)) || 'null');
+      if (!saved || saved.version !== 1) return null;
+      return {
+        view: ['annotations', 'fold', 'translation'].includes(saved.view) ? saved.view : null,
+        groupMode: GROUP_MODES.some(([id]) => id === saved.groupMode) ? saved.groupMode : null,
+        level: [...LEVELS.map(([id]) => id), 'guide'].includes(saved.level) ? saved.level : null,
+        translationDisplay: ['parallel', 'original', 'chinese'].includes(saved.translationDisplay) ? saved.translationDisplay : null,
+        selection: Array.isArray(saved.selection) ? saved.selection.filter(entry => entry
+          && typeof entry.id === 'string' && entry.id && typeof entry.fingerprint === 'string' && entry.fingerprint)
+          .map(({ id, fingerprint }) => ({ id, fingerprint })) : [],
+      };
+    } catch { return null; }
+  }
+
+  function applyReaderState(scopeValue = activeScope) {
+    const saved = readReaderState(scopeValue);
+    pendingReaderSelection = saved?.selection || [];
+    state.selectionRestoreNotice = '';
+    if (saved?.view) state.view = saved.view;
+    if (saved?.groupMode) state.groupMode = saved.groupMode;
+    if (saved?.level) state.level = saved.level;
+    if (saved?.translationDisplay) state.translationDisplay = saved.translationDisplay;
+  }
+
+  function persistReaderState() {
+    if (!activeScope) return;
+    const selection = new Map(pendingReaderSelection.map(({ id, fingerprint }) => [id, { id, fingerprint }]));
+    for (const record of state.selected.values()) {
+      if (typeof record?.id === 'string' && typeof record?.fingerprint === 'string') {
+        selection.set(record.id, { id: record.id, fingerprint: record.fingerprint });
+      }
+    }
+    try {
+      document.defaultView.localStorage.setItem(readerStateStorageKey(), JSON.stringify({
+        version: 1,
+        view: state.view,
+        groupMode: state.groupMode,
+        level: state.level,
+        translationDisplay: state.translationDisplay,
+        selection: [...selection.values()],
+      }));
+    } catch { /* the current panel state remains available in memory */ }
+  }
+
+  function restoreReaderSelection() {
+    const recordsById = new Map(state.papers.flatMap(paper => paper.records || []).map(record => [record.id, record]));
+    const restored = new Map();
+    const unresolved = [];
+    let changedCount = 0;
+    const dataMayBeIncomplete = Boolean(state.readError || state.incomplete || state.errors.length);
+    for (const saved of pendingReaderSelection) {
+      const record = recordsById.get(saved.id);
+      if (!record) {
+        if (dataMayBeIncomplete) unresolved.push(saved);
+        else changedCount += 1;
+      } else if (record.fingerprint === saved.fingerprint) {
+        restored.set(record.id, record);
+      } else {
+        changedCount += 1;
+      }
+    }
+    state.selected = restored;
+    pendingReaderSelection = unresolved;
+    state.selectionRestoreNotice = changedCount
+      ? `${changedCount} 条已选材料的来源已变化或不在当前范围，已取消这些选择。` : '';
+    persistReaderState();
+  }
+
+  state.savedJobs = readSavedJobReferences();
+  applyReaderState();
   const ZOTERO_COLOR_CLASSES = new Map([
     ['#ffd400', 'rw-zotero-yellow'],
     ['#ffff00', 'rw-zotero-yellow-legacy'],
@@ -163,20 +288,58 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
     return ANNOTATION_KIND_LABELS.get(record.kind) || '批注';
   }
 
+  function isHighlightRecord(record) {
+    return record?.kind === 'highlight' || record?.kind === 'underline';
+  }
+
+  function explicitResearchType(record) {
+    try {
+      const helper = document.defaultView?.wbHighlightPresets
+        || (typeof wbHighlightPresets === 'undefined' ? null : wbHighlightPresets);
+      if (typeof helper?.annotationHighlightType === 'function') {
+        const resolved = helper.annotationHighlightType(record);
+        if (resolved?.explicit && resolved.typeLabel) return resolved.typeLabel;
+        return '未分类';
+      }
+    } catch { /* standalone test hosts may not inject the preset helper */ }
+    return record?.typeExplicit === true && record?.typeLabel ? text(record.typeLabel) : '未分类';
+  }
+
+  function zoteroColorLabel(value) {
+    if (typeof value !== 'string' || !/^#[\da-f]{6}$/i.test(value)) return '未设颜色';
+    const labels = new Map([
+      ['#ffd400', '黄色'], ['#ffff00', '黄色'], ['#ff6666', '红色'], ['#5fb236', '绿色'],
+      ['#2ea8e5', '蓝色'], ['#a28ae5', '紫色'], ['#e56eee', '洋红色'], ['#f19837', '橙色'], ['#aaaaaa', '灰色'],
+    ]);
+    return labels.get(value.toLowerCase()) || '其他颜色';
+  }
+
+  function groupLabel(record, mode) {
+    if (mode === 'color') return zoteroColorLabel(record.color);
+    if (mode === 'kind') return materialKindLabel(record);
+    if (mode === 'researchType') return explicitResearchType(record);
+    return record.title || record.itemKey || '未命名文献';
+  }
+
   function zoteroColorClass(value) {
     if (typeof value !== 'string' || !/^#[\da-f]{6}$/i.test(value)) return '';
     return ZOTERO_COLOR_CLASSES.get(value.toLowerCase()) || '';
   }
 
-  function saveJobReference(job, kind, scopeValue = activeScope) {
+  function saveJobReference(job, kind, scopeValue = activeScope, metadata = {}) {
     try {
       const storage = document.defaultView.localStorage;
       const storageKey = jobStorageKeyFor(scopeValue);
       const refs = JSON.parse(storage.getItem(storageKey) || '[]');
-      const reference = { id: job.id, kind, library, updatedAt: Date.now() };
+      const reference = {
+        id: job.id, kind, library, updatedAt: Date.now(),
+        ...(metadata.itemKey ? { itemKey: metadata.itemKey } : {}),
+        ...(metadata.title ? { title: metadata.title } : {}),
+      };
       const next = Array.isArray(refs) ? refs.filter(ref => ref.id !== job.id) : [];
       next.push(reference);
       storage.setItem(storageKey, JSON.stringify(next));
+      if (scopeValue === activeScope) state.savedJobs = [...next].sort((left, right) => (right.updatedAt || 0) - (left.updatedAt || 0));
     } catch {
       // The panel can still run; persistence is an optional reload convenience.
     }
@@ -191,6 +354,7 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
       const next = refs.filter(reference => reference.id !== id);
       if (next.length) storage.setItem(storageKey, JSON.stringify(next));
       else storage.removeItem(storageKey);
+      if (scopeValue === activeScope) state.savedJobs = readSavedJobReferences(scopeValue);
     } catch {
       // Ignore storage being unavailable.
     }
@@ -202,6 +366,15 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
       ...activeScope,
       ...(Array.isArray(activeScope.keys) ? { keys: [...activeScope.keys] } : {}),
     } : null;
+    applyReaderState(requestScope);
+    materialsReady = false;
+    stopAnnotationTranslationQueue({ cancelActive: true, render: false });
+    state.annotationTranslations.clear();
+    state.annotationTranslationStatuses.clear();
+    annotationTranslationVerificationJobs.clear();
+    annotationTranslationVerificationBySource.clear();
+    annotationTranslationVerificationBusy.clear();
+    annotationTranslationAttempts = new Set();
     const requestLibrary = requestScope?.library || library;
     state.loading = true;
     state.papers = [];
@@ -257,22 +430,351 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
     } finally {
       if (current(epoch)) {
         state.loading = false;
+        materialsReady = true;
+        if (requestScope) restoreReaderSelection();
         render();
+        if (!state.readError && recoverySettled) scheduleAnnotationTranslationBatch();
       }
     }
   }
 
+  function annotationTranslationClass(record) {
+    if (!isHighlightRecord(record) || typeof record.text !== 'string' || !record.text.trim()) return 'ineligible';
+    if (/[\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(record.text)) return 'automatic';
+    const letters = [...record.text.matchAll(/\p{L}/gu)].length;
+    const han = [...record.text.matchAll(/\p{Script=Han}/gu)].length;
+    if (han) return han / Math.max(letters, 1) >= 0.5 ? 'cjk' : 'ambiguous';
+    return /\p{L}/u.test(record.text) ? 'automatic' : 'ineligible';
+  }
+
+  function translationCandidates() {
+    const seen = new Set();
+    const records = [];
+    for (const paper of state.papers) {
+      for (const record of paper.records || []) {
+        if (seen.has(record.id)) continue;
+        seen.add(record.id);
+        if (annotationTranslationClass(record) === 'automatic') records.push(record);
+      }
+    }
+    return records;
+  }
+
+  function translationPendingRecords() {
+    return translationCandidates().filter(record => !annotationTranslationAttempts.has(record.id)
+      && !state.annotationTranslations.has(record.id));
+  }
+
+  function persistAutoTranslateSetting() {
+    try { document.defaultView.localStorage.setItem(AUTO_TRANSLATE_SETTING, String(state.autoTranslateAnnotations)); }
+    catch { /* the in-memory setting still applies for this panel */ }
+  }
+
+  function stopAnnotationTranslationQueue({ cancelActive = true, render: shouldRender = true } = {}) {
+    annotationTranslationEpoch += 1;
+    if (annotationTranslationTimer) clearTimeout(annotationTranslationTimer);
+    annotationTranslationTimer = null;
+    const wakePoller = annotationTranslationWaitResolve;
+    annotationTranslationWaitResolve = null;
+    wakePoller?.();
+    const job = annotationTranslationJob;
+    annotationTranslationJob = null;
+    annotationTranslationStartingEpoch = null;
+    if (cancelActive && job?.id) {
+      void call('cancel_research_job', { id: job.id }).catch(() => {});
+      for (const record of job.records || []) {
+        if (state.annotationTranslationStatuses.get(record.id) === 'running') {
+          state.annotationTranslationStatuses.delete(record.id);
+          annotationTranslationAttempts.delete(record.id);
+        }
+      }
+    }
+    if (shouldRender && !disposed) render();
+  }
+
+  function translationTextFor(result, record) {
+    if (result?.format !== 'zotero-workbench/annotation-translations' || result.version !== 1
+        || result.targetLanguage !== 'zh-CN' || result.provenance?.translationVersion !== 'zotero-workbench-zh-v1'
+        || result.coverage?.complete !== true || !Array.isArray(result.translations)
+        || result.coverage.total !== result.translations.length
+        || new Set(result.translations.map(item => item?.sourceId)).size !== result.translations.length) return '';
+    const entry = result.translations.find(item => item?.sourceId === record.id);
+    if (!entry || entry.fingerprint !== record.fingerprint || !/^[a-f0-9]{64}$/.test(entry.originalFingerprint || '')
+        || entry.original !== record.text || entry.kind !== record.kind || entry.pageIndex !== record.pageIndex
+        || typeof entry.translation !== 'string' || !entry.translation.trim()) return '';
+    return entry.translation;
+  }
+
+  async function pollAnnotationTranslation(started, records, epoch) {
+    const isCurrent = () => !disposed && epoch === annotationTranslationEpoch;
+    let snapshot;
+    while (isCurrent()) {
+      snapshot = await call('research_job', { id: started.id });
+      if (!isCurrent()) return;
+      if (TERMINAL.has(snapshot?.status)) break;
+      for (const record of records) state.annotationTranslationStatuses.set(record.id, 'running');
+      render();
+      await new Promise(resolve => {
+        annotationTranslationWaitResolve = resolve;
+        annotationTranslationTimer = setTimeout(() => {
+          annotationTranslationTimer = null;
+          annotationTranslationWaitResolve = null;
+          resolve();
+        }, 1200);
+      });
+    }
+    if (!isCurrent()) return;
+    annotationTranslationJob = null;
+    if (snapshot?.status === 'completed') {
+      for (const record of records) {
+        const translation = translationTextFor(snapshot.result, record);
+        if (translation) {
+          state.annotationTranslations.set(record.id, { fingerprint: record.fingerprint, original: record.text, translation });
+          state.annotationTranslationStatuses.set(record.id, 'completed');
+        } else {
+          state.annotationTranslationStatuses.set(record.id, 'failed');
+        }
+        annotationTranslationAttempts.add(record.id);
+        annotationTranslationVerificationBySource.delete(record.id);
+      }
+      annotationTranslationVerificationJobs.delete(started.id);
+    } else if (snapshot?.status === 'verification_required') {
+      const verification = { id: started.id, records: [...records] };
+      annotationTranslationVerificationJobs.set(started.id, verification);
+      for (const record of records) {
+        state.annotationTranslations.delete(record.id);
+        state.annotationTranslationStatuses.set(record.id, 'verification_required');
+        annotationTranslationVerificationBySource.set(record.id, started.id);
+        annotationTranslationAttempts.add(record.id);
+      }
+    } else {
+      for (const record of records) {
+        state.annotationTranslationStatuses.set(record.id, snapshot?.status === 'cancelled' ? 'cancelled' : 'failed');
+        annotationTranslationAttempts.add(record.id);
+        annotationTranslationVerificationBySource.delete(record.id);
+      }
+      annotationTranslationVerificationJobs.delete(started.id);
+    }
+    render();
+    if (snapshot?.status === 'completed'
+        && records.every(record => state.annotationTranslationStatuses.get(record.id) === 'completed'
+          && state.annotationTranslations.get(record.id)?.fingerprint === record.fingerprint)) {
+      scheduleAnnotationTranslationBatch();
+    }
+  }
+
+  async function reverifyAnnotationTranslations(jobId) {
+    const verification = annotationTranslationVerificationJobs.get(jobId);
+    if (!verification || annotationTranslationVerificationBusy.size || annotationTranslationJob || annotationTranslationStartingEpoch !== null) return;
+    const scopeEpoch = loadEpoch;
+    const epoch = annotationTranslationEpoch;
+    annotationTranslationVerificationBusy.add(jobId);
+    for (const record of verification.records) state.annotationTranslationStatuses.set(record.id, 'verifying');
+    render();
+    try {
+      const snapshot = await call('research_job', { id: jobId });
+      if (disposed || scopeEpoch !== loadEpoch || annotationTranslationVerificationJobs.get(jobId) !== verification) return;
+      if (snapshot?.status === 'completed') {
+        for (const record of verification.records) {
+          const current = state.papers.flatMap(paper => paper.records || []).find(item => item.id === record.id);
+          const translation = current?.fingerprint === record.fingerprint ? translationTextFor(snapshot.result, current) : '';
+          if (translation) {
+            state.annotationTranslations.set(record.id, { fingerprint: current.fingerprint, original: current.text, translation });
+            state.annotationTranslationStatuses.set(record.id, 'completed');
+          } else {
+            state.annotationTranslations.delete(record.id);
+            state.annotationTranslationStatuses.set(record.id, 'failed');
+          }
+          annotationTranslationVerificationBySource.delete(record.id);
+          annotationTranslationAttempts.add(record.id);
+        }
+        annotationTranslationVerificationJobs.delete(jobId);
+      } else if (snapshot?.status === 'verification_required') {
+        for (const record of verification.records) {
+          state.annotationTranslations.delete(record.id);
+          state.annotationTranslationStatuses.set(record.id, 'verification_required');
+        }
+      } else if (TERMINAL.has(snapshot?.status)) {
+        for (const record of verification.records) {
+          state.annotationTranslations.delete(record.id);
+          state.annotationTranslationStatuses.set(record.id, snapshot.status === 'cancelled' ? 'cancelled' : 'failed');
+          annotationTranslationVerificationBySource.delete(record.id);
+          annotationTranslationAttempts.add(record.id);
+        }
+        annotationTranslationVerificationJobs.delete(jobId);
+      } else {
+        annotationTranslationJob = { id: jobId, records: verification.records, epoch };
+        await pollAnnotationTranslation({ id: jobId }, verification.records, epoch);
+      }
+    } catch (error) {
+      if (!disposed && scopeEpoch === loadEpoch && annotationTranslationVerificationJobs.get(jobId) === verification) {
+        if (annotationTranslationJob?.id === jobId) annotationTranslationJob = null;
+        state.translationError = error?.message || String(error);
+        for (const record of verification.records) state.annotationTranslationStatuses.set(record.id, 'verification_required');
+      }
+    } finally {
+      annotationTranslationVerificationBusy.delete(jobId);
+      if (!disposed && scopeEpoch === loadEpoch) {
+        render();
+        if (verification.records.every(record => state.annotationTranslationStatuses.get(record.id) === 'completed'
+            && state.annotationTranslations.get(record.id)?.fingerprint === record.fingerprint)) {
+          scheduleAnnotationTranslationBatch();
+        }
+      }
+    }
+  }
+
+  async function translateAnnotationRecords(records, { automatic = false, retry = false } = {}) {
+    const uniqueRecords = [...new Map(records.filter(record => record && ['automatic', 'ambiguous'].includes(annotationTranslationClass(record)))
+      .map(record => [record.id, record])).values()];
+    if (!uniqueRecords.length || annotationTranslationJob || annotationTranslationStartingEpoch !== null || annotationTranslationVerificationBusy.size) return;
+    if (automatic && (!state.autoTranslateAnnotations || state.loading || state.job && !TERMINAL.has(state.job.status))) return;
+    const batch = uniqueRecords.slice(0, 20);
+    const epoch = ++annotationTranslationEpoch;
+    annotationTranslationStartingEpoch = epoch;
+    for (const record of batch) {
+      if (retry) annotationTranslationAttempts.delete(record.id);
+      annotationTranslationAttempts.add(record.id);
+      state.annotationTranslationStatuses.set(record.id, 'starting');
+    }
+    render();
+    try {
+      const args = {
+        kind: 'translate_annotations',
+        library,
+        keys: unique(batch.map(record => record.itemKey)),
+        sourceIds: batch.map(record => record.id),
+        sourceVersions: Object.fromEntries(batch.map(record => [record.id, record.fingerprint])),
+      };
+      const started = await call('start_research_job', args);
+      if (disposed || epoch !== annotationTranslationEpoch) {
+        if (annotationTranslationStartingEpoch === epoch) annotationTranslationStartingEpoch = null;
+        if (started?.id) void call('cancel_research_job', { id: started.id }).catch(() => {});
+        return;
+      }
+      annotationTranslationStartingEpoch = null;
+      if (!started?.id) throw new Error('翻译服务未返回任务编号。');
+      annotationTranslationJob = { id: started.id, records: batch, epoch };
+      for (const record of batch) state.annotationTranslationStatuses.set(record.id, 'running');
+      render();
+      await pollAnnotationTranslation(started, batch, epoch);
+    } catch (error) {
+      if (disposed || epoch !== annotationTranslationEpoch) return;
+      annotationTranslationStartingEpoch = null;
+      annotationTranslationJob = null;
+      for (const record of batch) state.annotationTranslationStatuses.set(record.id, 'failed');
+      state.translationError = error?.message || String(error);
+      render();
+    }
+  }
+
+  function scheduleAnnotationTranslationBatch() {
+    if (disposed || state.loading || !state.autoTranslateAnnotations || state.job && !TERMINAL.has(state.job.status)) return;
+    if (annotationTranslationJob || annotationTranslationVerificationBusy.size) return;
+    const pending = translationPendingRecords();
+    if (pending.length) void translateAnnotationRecords(pending.slice(0, 20), { automatic: true });
+  }
+
+  function continueAnnotationTranslationBatch() {
+    const pending = translationPendingRecords();
+    if (pending.length) void translateAnnotationRecords(pending.slice(0, 20), { automatic: state.autoTranslateAnnotations });
+  }
+
+  function toggleAutoAnnotationTranslation() {
+    state.autoTranslateAnnotations = !state.autoTranslateAnnotations;
+    persistAutoTranslateSetting();
+    if (!state.autoTranslateAnnotations) stopAnnotationTranslationQueue({ cancelActive: true, render: false });
+    else scheduleAnnotationTranslationBatch();
+    render();
+  }
+
+  function renderAnnotationTranslation(record) {
+    if (!isHighlightRecord(record)) return null;
+    const classification = annotationTranslationClass(record);
+    if (classification === 'cjk' || classification === 'ineligible') return null;
+    const translated = state.annotationTranslations.get(record.id);
+    const status = state.annotationTranslationStatuses.get(record.id);
+    const section = el(document, 'section', 'rw-annotation-translation');
+    if (translated && translated.fingerprint === record.fingerprint && translated.original === record.text
+        && typeof translated.translation === 'string') {
+      section.append(el(document, 'span', 'rw-origin-label rw-machine-label', '机器译文'));
+      section.append(renderLongText(translated.translation, '译文'));
+      return section;
+    }
+    if (status === 'starting' || status === 'running') {
+      section.append(el(document, 'span', 'rw-muted', status === 'starting' ? '正在准备译文…' : '正在生成译文…'));
+      return section;
+    }
+    if (status === 'verifying') {
+      section.append(el(document, 'span', 'rw-muted', '正在重新核验译文…'));
+      return section;
+    }
+    if (status === 'verification_required') {
+      const jobId = annotationTranslationVerificationBySource.get(record.id);
+      section.append(el(document, 'span', 'rw-muted', '来源待核验，暂不显示旧译文。'));
+      if (jobId) section.append(button('重新核验', 'rw-link-button', () => {
+        void reverifyAnnotationTranslations(jobId);
+      }, { disabled: annotationTranslationVerificationBusy.has(jobId) }));
+      return section;
+    }
+    if (status === 'failed' || status === 'cancelled') {
+      section.append(el(document, 'span', 'rw-muted', status === 'cancelled' ? '翻译已停止。' : '翻译失败，可单条重试。'));
+      section.append(button('重试翻译', 'rw-link-button', () => {
+        state.translationError = '';
+        void translateAnnotationRecords([record], { retry: true });
+      }));
+      return section;
+    }
+    if (classification === 'ambiguous' || !state.autoTranslateAnnotations) {
+      section.append(button('翻译', 'rw-link-button', () => {
+        state.translationError = '';
+        void translateAnnotationRecords([record], { retry: true });
+      }));
+      return section;
+    }
+    section.append(el(document, 'span', 'rw-muted', '等待对照'));
+    return section;
+  }
+
+  function renderAnnotationTranslationControls() {
+    const section = el(document, 'section', 'rw-translation-controls');
+    const heading = el(document, 'div', 'rw-section-heading');
+    heading.append(el(document, 'strong', '', '原文中文对照'));
+    heading.append(button(state.autoTranslateAnnotations ? '停止自动对照' : '开启自动对照', 'rw-link-button', toggleAutoAnnotationTranslation, {
+      pressed: state.autoTranslateAnnotations,
+    }));
+    section.append(heading);
+    section.append(el(document, 'p', 'rw-muted', '使用已配置的 Codex 模型；结果缓存在本机，不修改 Zotero。仅处理当前已载入的高亮和下划线。'));
+    const candidates = translationCandidates();
+    const translated = candidates.filter(record => state.annotationTranslations.has(record.id)).length;
+    const failed = candidates.filter(record => ['failed', 'cancelled'].includes(state.annotationTranslationStatuses.get(record.id))).length;
+    const verificationRequired = candidates.filter(record => state.annotationTranslationStatuses.get(record.id) === 'verification_required').length;
+    const pending = translationPendingRecords().length;
+    const active = annotationTranslationJob?.records?.length || 0;
+    section.append(el(document, 'p', 'rw-translation-progress', `已译 ${translated} 条${active ? ` · 正在处理 ${active} 条` : ''}${pending ? ` · 待处理 ${pending} 条` : ''}${verificationRequired ? ` · 待核验 ${verificationRequired} 条` : ''}${failed ? ` · 失败 ${failed} 条` : ''}`));
+    if (state.translationError) section.append(el(document, 'p', 'rw-alert', `翻译失败：${state.translationError}`));
+    if (pending && !active && state.autoTranslateAnnotations && !state.loading && (!state.job || TERMINAL.has(state.job.status))) {
+      section.append(button(`继续翻译下一批（${Math.min(20, pending)} 条）`, 'rw-button rw-button-muted', continueAnnotationTranslationBatch));
+    }
+    return section;
+  }
+
   function updateRecordSelection(record, checked) {
+    pendingReaderSelection = pendingReaderSelection.filter(saved => saved.id !== record.id);
     if (checked) state.selected.set(record.id, record);
     else state.selected.delete(record.id);
+    persistReaderState();
     render();
   }
 
   function togglePaper(paper, checked) {
+    const ids = new Set((paper.records || []).map(record => record.id));
+    pendingReaderSelection = pendingReaderSelection.filter(saved => !ids.has(saved.id));
     for (const record of paper.records || []) {
       if (checked) state.selected.set(record.id, record);
       else state.selected.delete(record.id);
     }
+    persistReaderState();
     render();
   }
 
@@ -286,12 +788,16 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
         if (snapshot.status === 'completed') {
           state.result = snapshot.result || null;
           state.level = 'topic';
-          state.view = kind === 'fold' ? 'fold' : 'annotations';
+          state.view = kind === 'fold' ? 'fold' : kind === 'translate' ? 'translation' : 'annotations';
           if (kind === 'draft') state.openSources.clear();
+          persistReaderState();
+        } else if (snapshot.status === 'verification_required') {
+          state.result = null;
         }
         if (TERMINAL.has(snapshot.status)) {
-          if (snapshot.status !== 'completed' || !snapshot.result) removeJobReference(id);
+          if (snapshot.status !== 'verification_required' && (snapshot.status !== 'completed' || !snapshot.result)) removeJobReference(id);
           render();
+          scheduleAnnotationTranslationBatch();
           return;
         }
         render();
@@ -310,6 +816,8 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
   async function recoverJob() {
     if (recoveryStarted) return;
     recoveryStarted = true;
+    const recoveryToken = ++recoveryEpoch;
+    try {
     let refs;
     try {
       refs = JSON.parse(document.defaultView.localStorage.getItem(jobStorageKeyFor()) || '[]');
@@ -318,11 +826,19 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
     }
     if (!Array.isArray(refs) || disposed || state.job) return;
     for (const saved of refs.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))) {
-      if (!saved?.id || saved.library !== library || !['fold', 'draft'].includes(saved.kind)) continue;
+      if (!saved?.id || saved.library !== library || !['fold', 'draft', 'translate'].includes(saved.kind)) continue;
       const epoch = ++jobEpoch;
       try {
         const snapshot = await call('research_job', { id: saved.id });
         if (disposed || epoch !== jobEpoch || state.job) return;
+        if (snapshot.status === 'verification_required') {
+          state.job = { ...snapshot, id: snapshot.id || saved.id, kind: saved.kind };
+          state.result = null;
+          state.view = saved.kind === 'fold' ? 'fold' : saved.kind === 'translate' ? 'translation' : 'annotations';
+          persistReaderState();
+          render();
+          return;
+        }
         if (TERMINAL.has(snapshot.status) && (snapshot.status !== 'completed' || !snapshot.result)) {
           removeJobReference(saved.id);
           continue;
@@ -330,7 +846,8 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
         state.job = { ...snapshot, id: snapshot.id || saved.id, kind: saved.kind };
         if (snapshot.status === 'completed') {
           state.result = snapshot.result || null;
-          state.view = saved.kind === 'fold' ? 'fold' : 'annotations';
+          state.view = saved.kind === 'fold' ? 'fold' : saved.kind === 'translate' ? 'translation' : 'annotations';
+          persistReaderState();
         }
         render();
         if (!TERMINAL.has(snapshot.status)) beginPolling(saved.id, saved.kind, epoch);
@@ -342,11 +859,24 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
         return;
       }
     }
+    } finally {
+      if (recoveryToken === recoveryEpoch) {
+        recoverySettled = true;
+        if (materialsReady && !state.readError) scheduleAnnotationTranslationBatch();
+      }
+    }
   }
 
   async function startJob(kind, args) {
     if (state.job && !TERMINAL.has(state.job.status)) return;
+    stopAnnotationTranslationQueue({ cancelActive: true, render: false });
     const jobScope = activeScope;
+    const itemKey = args.key || (Array.isArray(args.keys) && args.keys.length === 1 ? args.keys[0] : null);
+    const jobMetadata = {
+      ...(itemKey ? { itemKey } : {}),
+      title: state.papers.find(paper => paper.itemKey === itemKey)?.title
+        || (Array.isArray(args.keys) && args.keys.length > 1 ? `${args.keys.length} 篇文献` : ''),
+    };
     const epoch = ++jobEpoch;
     if (pollTimer) clearTimeout(pollTimer);
     pollTimer = null;
@@ -354,19 +884,81 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
     state.result = null;
     state.job = { kind, status: 'starting', stage: '准备任务', progress: 0 };
     if (kind === 'fold') state.view = 'fold';
+    else if (kind === 'translate') state.view = 'translation';
+    persistReaderState();
     render();
     try {
       const started = await call('start_research_job', args);
-      if (!disposed && epoch !== jobEpoch && started?.id) saveJobReference(started, kind, jobScope);
+      if (!disposed && epoch !== jobEpoch && started?.id) saveJobReference(started, kind, jobScope, jobMetadata);
       if (disposed || epoch !== jobEpoch) return;
       if (!started?.id) throw new Error('研究服务未返回任务编号。');
       state.job = { ...started, kind };
-      saveJobReference(started, kind, jobScope);
+      saveJobReference(started, kind, jobScope, jobMetadata);
       render();
       beginPolling(started.id, kind, epoch);
     } catch (error) {
       if (disposed || epoch !== jobEpoch) return;
       state.job = { kind, status: 'failed', error: error?.message || String(error) };
+      render();
+      scheduleAnnotationTranslationBatch();
+    }
+  }
+
+  async function openSavedResearchJob(reference) {
+    if (!reference?.id || !['fold', 'draft', 'translate'].includes(reference.kind)) return;
+    const epoch = ++jobEpoch;
+    if (pollTimer) clearTimeout(pollTimer);
+    pollTimer = null;
+    state.copyMessage = '';
+    state.result = null;
+    state.job = { id: reference.id, kind: reference.kind, status: 'starting', stage: '读取已保存结果', fromSavedList: true };
+    state.view = reference.kind === 'fold' ? 'fold' : reference.kind === 'translate' ? 'translation' : 'annotations';
+    persistReaderState();
+    render();
+    try {
+      const snapshot = await call('research_job', { id: reference.id });
+      if (disposed || epoch !== jobEpoch) return;
+      state.job = { ...snapshot, id: snapshot.id || reference.id, kind: reference.kind };
+      if (snapshot.status === 'completed') {
+        state.result = snapshot.result || null;
+        if (!state.result) state.job = { ...state.job, status: 'failed', error: '任务未返回可用结果。' };
+      }
+      render();
+      if (!TERMINAL.has(snapshot.status)) beginPolling(reference.id, reference.kind, epoch);
+    } catch (error) {
+      if (disposed || epoch !== jobEpoch) return;
+      state.job = { id: reference.id, kind: reference.kind, status: 'interrupted', error: error?.message || '无法读取已保存结果。' };
+      render();
+    }
+  }
+
+  async function reverifyJob() {
+    const job = state.job;
+    if (!job?.id || job.status !== 'verification_required' || job.verifying) return;
+    const epoch = ++jobEpoch;
+    if (pollTimer) clearTimeout(pollTimer);
+    pollTimer = null;
+    state.result = null;
+    state.job = { ...job, verifying: true, pollingError: '' };
+    render();
+    try {
+      const snapshot = await call('research_job', { id: job.id });
+      if (disposed || epoch !== jobEpoch) return;
+      state.job = { ...snapshot, id: snapshot.id || job.id, kind: job.kind };
+      if (snapshot.status === 'completed') {
+        state.result = snapshot.result || null;
+        if (!state.result) state.job = { ...state.job, status: 'failed', error: '任务未返回可用结果。' };
+      } else {
+        state.result = null;
+      }
+      if (snapshot.status !== 'verification_required' && TERMINAL.has(snapshot.status)
+          && (snapshot.status !== 'completed' || !snapshot.result)) removeJobReference(job.id);
+      render();
+      if (!TERMINAL.has(snapshot.status)) beginPolling(job.id, job.kind, epoch);
+    } catch (error) {
+      if (disposed || epoch !== jobEpoch) return;
+      state.result = null;
+      state.job = { ...job, verifying: false, pollingError: error?.message || String(error) };
       render();
     }
   }
@@ -387,6 +979,7 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
         if (pollTimer) clearTimeout(pollTimer);
         pollTimer = null;
         removeJobReference(job.id);
+        scheduleAnnotationTranslationBatch();
       } else {
         beginPolling(job.id, job.kind, epoch);
       }
@@ -418,11 +1011,21 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
     const job = state.job;
     const box = el(document, 'section', 'rw-job');
     const heading = el(document, 'div', 'rw-job-heading');
-    heading.append(el(document, 'strong', '', job.kind === 'fold' ? 'TextFold 全文阅读' : '标注写作'));
-    const statusTone = job.status === 'completed' ? 'success'
+    const jobLabels = {
+      fold: 'TextFold 全文阅读',
+      draft: '标注写作',
+      translate: '全文翻译',
+      translate_annotations: '标注原文对照',
+    };
+    heading.append(el(document, 'strong', '', jobLabels[job.kind] || '研究任务'));
+    const translationIncomplete = job.kind === 'translate' && job.status === 'completed'
+      && !translationIsComplete(job.result, Array.isArray(job.result?.pages) ? job.result.pages : []);
+    const statusTone = translationIncomplete ? 'error' : job.status === 'completed' ? 'success'
       : ['failed', 'interrupted'].includes(job.status) ? 'error'
         : ['starting', 'running'].includes(job.status) ? 'active' : 'neutral';
-    heading.append(badge('状态', ({ starting: '准备中', running: '进行中', completed: '已完成', failed: '失败', cancelled: '已取消', interrupted: '中断' })[job.status] || job.status || '读取中', statusTone));
+    const statusLabel = translationIncomplete ? '结果未完整'
+      : ({ starting: '准备中', running: '进行中', completed: '已完成', failed: '失败', cancelled: '已取消', interrupted: '中断', verification_required: '来源待核验' })[job.status] || job.status || '读取中';
+    heading.append(badge('状态', statusLabel, statusTone));
     box.append(heading);
     if (job.stage) box.append(el(document, 'p', 'rw-job-stage', job.stage));
     if (job.status === 'running' || job.status === 'starting') {
@@ -436,6 +1039,10 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
     if (job.error) box.append(el(document, 'p', 'rw-alert', job.error));
     if (job.pollingError) box.append(el(document, 'p', 'rw-alert', `任务状态读取失败：${job.pollingError}`));
     if (job.cancelError) box.append(el(document, 'p', 'rw-alert', `取消失败：${job.cancelError}`));
+    if (job.status === 'verification_required') {
+      box.append(el(document, 'p', 'rw-muted', '旧译文暂不显示。重新核验会读取同一任务，不会重新运行模型。'));
+      box.append(button(job.verifying ? '正在核验…' : '重新核验', 'rw-button rw-button-muted', reverifyJob, { disabled: Boolean(job.verifying) }));
+    }
     return box;
   }
 
@@ -541,6 +1148,7 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
   function chooseMaterialScope(nextScope, label = '') {
     scopeLookupEpoch += 1;
     activeScope = { library, ...nextScope };
+    state.savedJobs = readSavedJobReferences(activeScope);
     state.scopeItemLabel = nextScope.keys?.length === 1 ? label : '';
     state.scopePickerOpen = false;
     state.scopeLoading = false;
@@ -552,6 +1160,8 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
     state.showAllSelected = false;
     state.view = 'annotations';
     recoveryStarted = false;
+    recoverySettled = false;
+    recoveryEpoch += 1;
     jobEpoch += 1;
     if (pollTimer) clearTimeout(pollTimer);
     pollTimer = null;
@@ -658,9 +1268,10 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
 
     const nav = el(document, 'nav', 'rw-tabs');
     nav.setAttribute('aria-label', '研究视图');
-    for (const [id, label] of [['annotations', '我的标注'], ['fold', 'TextFold']]) {
+    for (const [id, label] of [['annotations', '我的标注'], ['fold', 'TextFold'], ['translation', '全文翻译']]) {
       nav.append(button(label, `rw-pill${state.view === id ? ' is-active' : ''}`, () => {
         state.view = id;
+        persistReaderState();
         render();
       }, { pressed: state.view === id }));
     }
@@ -680,8 +1291,32 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
     scopeLine.append(scopeControl);
     if (state.readError) scopeLine.append(el(document, 'span', 'rw-alert rw-alert-inline', state.readError));
     header.append(scopeLine);
+    if (state.selectionRestoreNotice) {
+      const notice = el(document, 'div', 'rw-alert rw-selection-restore-notice', state.selectionRestoreNotice);
+      notice.append(button('关闭', 'rw-link-button', () => {
+        state.selectionRestoreNotice = '';
+        render();
+      }));
+      header.append(notice);
+    }
     const job = renderJobStatus();
     if (job) header.append(job);
+    if (state.savedJobs.length) {
+      const saved = el(document, 'details', 'rw-saved-jobs');
+      saved.append(el(document, 'summary', '', `最近结果 · ${state.savedJobs.length}`));
+      const list = el(document, 'div', 'rw-saved-job-list');
+      for (const reference of state.savedJobs) {
+        const type = reference.kind === 'fold' ? 'TextFold' : reference.kind === 'translate' ? '全文翻译' : '标注写作';
+        const label = `${type}${reference.title ? ` · ${reference.title}` : ''} · ${reference.id.slice(-4)}`;
+        const savedButton = button(label, `rw-saved-job${state.job?.id === reference.id ? ' is-current' : ''}`, () => {
+          void openSavedResearchJob(reference);
+        }, { title: `读取已保存任务 ${reference.id}，不重新运行模型。` });
+        savedButton.dataset.jobId = reference.id;
+        list.append(savedButton);
+      }
+      saved.append(list);
+      header.append(saved);
+    }
     return header;
   }
 
@@ -700,7 +1335,9 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
     }
     line.append(button('清除', 'rw-link-button', () => {
       state.selected.clear();
+      pendingReaderSelection = [];
       state.showAllSelected = false;
+      persistReaderState();
       render();
     }));
     tray.append(line);
@@ -709,6 +1346,8 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
     for (const record of visible) {
       const chip = button(`× ${sourceLabel(record)}`, 'rw-chip', () => {
         state.selected.delete(record.id);
+        pendingReaderSelection = pendingReaderSelection.filter(saved => saved.id !== record.id);
+        persistReaderState();
         render();
       }, { label: `移除已选材料：${sourceLabel(record)}` });
       chips.append(chip);
@@ -730,15 +1369,15 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
     const kindTag = tag(record.kind === 'note' ? '▤' : '▧', materialKindLabel(record), colorClass ? `rw-annotation-tag ${colorClass}` : 'rw-annotation-tag');
     if (colorClass) kindTag.append(el(document, 'span', 'rw-color-dot'));
     top.append(kindTag);
-    if (record.pageLabel || Number.isInteger(record.pageIndex)) {
-      const pageText = record.pageLabel ? `页标 ${record.pageLabel}` : `PDF 第 ${record.pageIndex + 1} 页`;
-      top.append(tag('↗', pageText));
-    }
+    const researchType = explicitResearchType(record);
+    if (researchType !== '未分类') top.append(tag('▧', researchType, 'rw-research-type-tag'));
+    if (colorClass) kindTag.title = `Zotero 原标注颜色：${zoteroColorLabel(record.color)}`;
     item.append(top);
     if (record.text) {
-      const quote = el(document, 'div', record.kind === 'note' ? 'rw-note-text' : `rw-quote${colorClass ? ` ${colorClass}` : ''}`);
-      quote.append(el(document, 'span', 'rw-origin-label', record.kind === 'note' ? '独立笔记' : '原文摘录'));
-      quote.append(el(document, 'p', '', record.text));
+      const isNote = record.kind === 'note';
+      const quote = el(document, 'div', isNote ? 'rw-note-text' : `rw-quote${colorClass ? ` ${colorClass}` : ''}`);
+      quote.append(el(document, 'span', 'rw-origin-label', isNote ? '独立笔记' : isHighlightRecord(record) ? '高亮原文' : '原文批注'));
+      quote.append(renderLongText(record.text, isNote ? '笔记' : '原文'));
       item.append(quote);
     }
     if (record.comment) {
@@ -747,8 +1386,30 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
       comment.append(el(document, 'p', '', record.comment));
       item.append(comment);
     }
-    if (record.url) item.append(button(record.kind === 'note' ? '回到笔记' : '回到原文', 'rw-link-button', () => requestRead(record)));
+    const translation = renderAnnotationTranslation(record);
+    if (translation) item.append(translation);
+    const sourceLine = el(document, 'div', 'rw-record-source');
+    sourceLine.append(el(document, 'span', 'rw-record-source-title', record.title || record.itemKey || '来源文献'));
+    if (record.pageLabel || Number.isInteger(record.pageIndex)) {
+      const pageText = [
+        Number.isInteger(record.pageIndex) ? `PDF 第 ${record.pageIndex + 1} 页` : '',
+        record.pageLabel ? `页标 ${record.pageLabel}` : '',
+      ].filter(Boolean).join(' · ');
+      sourceLine.append(el(document, 'span', 'rw-muted', pageText));
+    }
+    if (record.url) sourceLine.append(button(record.kind === 'note' ? '回到笔记' : '回到原文', 'rw-link-button', () => requestRead(record)));
+    item.append(sourceLine);
     return item;
+  }
+
+  function renderLongText(value, label) {
+    const wrapper = el(document, 'div', 'rw-long-text');
+    wrapper.append(el(document, 'p', 'rw-long-text-preview', value));
+    const details = el(document, 'details', 'rw-long-text-details');
+    details.append(el(document, 'summary', '', `展开完整${label}`));
+    details.append(el(document, 'p', '', value));
+    wrapper.append(details);
+    return wrapper;
   }
 
   function paperIsSelected(paper) {
@@ -756,7 +1417,7 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
     return records.length > 0 && records.every(record => state.selected.has(record.id));
   }
 
-  function renderPaper(paper) {
+  function renderPaper(paper, visibleRecords = paper.records || []) {
     const section = el(document, 'section', 'rw-paper');
     const heading = el(document, 'div', 'rw-paper-heading');
     const select = el(document, 'input', 'rw-checkbox');
@@ -775,15 +1436,77 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
       disabled: Boolean(state.job && !TERMINAL.has(state.job.status)),
       title: '需要可读取文本的 PDF；无 PDF 或扫描页会明确报错，不会生成降级摘要。',
     }));
+    heading.append(button('全文翻译', 'rw-button rw-button-muted', () => startJob('translate', {
+      kind: 'translate', library, key: paper.itemKey,
+    }), {
+      disabled: Boolean(state.job && !TERMINAL.has(state.job.status)),
+      title: '逐页翻译单篇 PDF 的可提取文字，并保留页码回链。',
+    }));
     section.append(heading);
     if (paper.errors?.length) {
       for (const error of paper.errors) section.append(el(document, 'p', 'rw-alert', error.message || '部分批注读取失败。'));
     }
     const records = el(document, 'div', 'rw-records');
-    for (const record of paper.records || []) records.append(renderRecord(record));
-    if (!paper.records?.length && !paper.errors?.length) records.append(el(document, 'p', 'rw-muted', '这篇文献没有可整理的高亮、批注或子笔记。'));
+    for (const record of visibleRecords) records.append(renderRecord(record));
+    if (!visibleRecords.length && !paper.errors?.length) records.append(el(document, 'p', 'rw-muted', '这一组中没有材料。'));
     section.append(records);
     return section;
+  }
+
+  function renderMaterialGroups() {
+    if (state.groupMode === 'paper') {
+      const papers = el(document, 'div', 'rw-papers');
+      for (const paper of state.papers) papers.append(renderPaper(paper));
+      return papers;
+    }
+
+    const grouped = new Map();
+    for (const paper of state.papers) {
+      for (const record of paper.records || []) {
+        const label = groupLabel(record, state.groupMode);
+        if (!grouped.has(label)) grouped.set(label, new Map());
+        const byPaper = grouped.get(label);
+        if (!byPaper.has(paper.itemKey)) byPaper.set(paper.itemKey, []);
+        byPaper.get(paper.itemKey).push(record);
+      }
+    }
+    const root = el(document, 'div', 'rw-material-groups');
+    const groups = [...grouped].sort(([left], [right]) => left.localeCompare(right, 'zh-CN'));
+    for (const [label, byPaper] of groups) {
+      const group = el(document, 'section', 'rw-material-group');
+      const heading = el(document, 'h3', 'rw-material-group-heading');
+      if (state.groupMode === 'color') {
+        const colorClass = [...ZOTERO_COLOR_CLASSES.entries()].find(([hex]) => zoteroColorLabel(hex) === label)?.[1] || '';
+        const swatch = el(document, 'span', `rw-material-color-swatch${colorClass ? ` ${colorClass}` : ''}`);
+        swatch.setAttribute('aria-hidden', 'true');
+        heading.append(swatch);
+      }
+      heading.append(document.createTextNode(label));
+      heading.append(badge('材料', [...byPaper.values()].reduce((sum, records) => sum + records.length, 0)));
+      group.append(heading);
+      const papers = el(document, 'div', 'rw-group-papers');
+      for (const [itemKey, records] of byPaper) {
+        const paper = state.papers.find(entry => entry.itemKey === itemKey);
+        if (paper) papers.append(renderPaper(paper, records));
+      }
+      group.append(papers);
+      root.append(group);
+    }
+    if (!groups.length) root.append(el(document, 'p', 'rw-empty', '当前范围内没有可分组的材料。'));
+    return root;
+  }
+
+  function renderGroupModePicker() {
+    const nav = el(document, 'nav', 'rw-group-mode');
+    nav.setAttribute('aria-label', '材料分组方式');
+    for (const [mode, label] of GROUP_MODES) {
+      nav.append(button(label, `rw-pill${state.groupMode === mode ? ' is-active' : ''}`, () => {
+        state.groupMode = mode;
+        persistReaderState();
+        render();
+      }, { pressed: state.groupMode === mode }));
+    }
+    return nav;
   }
 
   function draftMarkdown(result) {
@@ -794,7 +1517,8 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
       const refs = (paragraph.sourceIds || []).map(id => {
         const record = sources.get(id);
         if (!record) return `- 来源 ID：${markdownEscape(id)}`;
-        const label = `${record.title || record.itemKey}${Number.isInteger(record.pageIndex) ? `，PDF 第 ${record.pageIndex + 1} 页` : ''}，${record.kind === 'note' ? '独立笔记' : materialKindLabel(record)}`;
+        const type = explicitResearchType(record);
+        const label = `${record.title || record.itemKey}${Number.isInteger(record.pageIndex) ? `，PDF 第 ${record.pageIndex + 1} 页` : ''}，${record.kind === 'note' ? '独立笔记' : materialKindLabel(record)}${type !== '未分类' ? `，研究类型：${type}` : ''}`;
         return record.url ? `- [${markdownEscape(label)}](${markdownUrl(record.url)})` : `- ${markdownEscape(label)}（Zotero ${record.library}/${record.key}）`;
       });
       lines.push(...refs, '');
@@ -829,8 +1553,10 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
     const sourceTag = tag(record.kind === 'note' ? '▤' : '▧', sourceLabel(record), colorClass ? `rw-annotation-tag ${colorClass}` : 'rw-annotation-tag');
     if (colorClass) sourceTag.append(el(document, 'span', 'rw-color-dot'));
     source.append(sourceTag);
+    const researchType = explicitResearchType(record);
+    if (researchType !== '未分类') source.append(tag('▧', `研究类型：${researchType}`, 'rw-research-type-tag'));
     if (record.text) {
-      source.append(el(document, 'span', 'rw-origin-label', record.kind === 'note' ? '独立笔记' : '原文摘录'));
+      source.append(el(document, 'span', 'rw-origin-label', record.kind === 'note' ? '独立笔记' : isHighlightRecord(record) ? '高亮原文' : '原文批注'));
       const excerpt = el(document, 'p', `rw-source-excerpt${record.kind === 'note' ? ' rw-source-note' : ` rw-source-quote${colorClass ? ` ${colorClass}` : ''}`}`, record.text);
       source.append(excerpt);
     }
@@ -954,6 +1680,8 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
       controls.append(errors);
     }
     body.append(controls);
+    body.append(renderGroupModePicker());
+    body.append(renderAnnotationTranslationControls());
     if (state.selected.size) {
       const actionbar = el(document, 'div', 'rw-selection-bar');
       actionbar.append(el(document, 'span', '', `已选 ${state.selected.size} 条材料`));
@@ -969,9 +1697,7 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
       body.append(el(document, 'p', 'rw-empty', '当前范围内没有可读取的标注文献。'));
     }
 
-    const papers = el(document, 'div', 'rw-papers');
-    for (const paper of state.papers) papers.append(renderPaper(paper));
-    body.append(papers);
+    body.append(renderMaterialGroups());
     body.append(renderDraftComposer());
     if (state.result && state.job?.kind === 'draft') body.append(renderDraftResult(state.result));
     if (state.readError) body.append(el(document, 'p', 'rw-alert', state.readError));
@@ -1020,13 +1746,17 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
 
     const levels = el(document, 'nav', 'rw-levels');
     levels.setAttribute('aria-label', 'TextFold 阅读层级');
-    for (const [id, label] of LEVELS) {
+    for (const [id, label] of [...LEVELS, ['guide', '研究导读']]) {
       levels.append(button(label, `rw-pill${state.level === id ? ' is-active' : ''}`, () => {
         state.level = id;
+        persistReaderState();
         render();
       }, { pressed: state.level === id }));
     }
     panel.append(levels);
+    if (state.level === 'guide') {
+      panel.append(renderResearchGuide(result));
+    } else {
     const isAi = state.level !== 'brief' && state.level !== 'full';
     panel.append(el(document, 'p', 'rw-muted rw-level-note', isAi
       ? '当前层展示 AI 生成的主题、结论或要点；关键原句与全文为 PDF 原文。'
@@ -1070,6 +1800,7 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
       sections.append(sectionBox);
     }
     panel.append(sections);
+    }
     if (result.source?.sha256 || result.provenance?.made_with) {
       const provenance = el(document, 'details', 'rw-provenance');
       provenance.append(el(document, 'summary', '', '来源与任务信息'));
@@ -1096,6 +1827,9 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
           disabled: Boolean(state.job && !TERMINAL.has(state.job.status)),
           title: '需要可读取文本的 PDF；无 PDF 或扫描页会明确报错，不会生成降级摘要。',
         }));
+        row.append(button('全文翻译', 'rw-button rw-button-muted', () => startJob('translate', {
+          kind: 'translate', library, key: paper.itemKey,
+        }), { disabled: Boolean(state.job && !TERMINAL.has(state.job.status)) }));
         papers.append(row);
       }
       body.append(papers);
@@ -1104,9 +1838,223 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
     return body;
   }
 
+  function renderResearchGuide(result) {
+    const section = el(document, 'section', 'rw-research-guide');
+    section.append(el(document, 'p', 'rw-muted', '研究导读来自 AI 概括；每条原文证据单独标注并可回到 PDF 页码核对。'));
+    const guide = result.researchGuide;
+    const groups = GUIDE_SECTIONS.map(([key, label]) => {
+      const value = guide?.[key];
+      return value && Array.isArray(value.items) && Array.isArray(value.gaps)
+        ? { key, label, items: value.items, gaps: value.gaps }
+        : null;
+    }).filter(Boolean);
+    if (!groups.length) {
+      section.append(el(document, 'p', 'rw-empty', '当前 TextFold 结果没有 researchGuide 数据。'));
+      return section;
+    }
+    for (const group of groups) {
+      const card = el(document, 'section', 'rw-guide-section');
+      card.append(el(document, 'h3', '', group.label));
+      for (const entry of group.items) {
+        if (!entry || typeof entry.text !== 'string' || !entry.text.trim()) continue;
+        const ai = el(document, 'p', 'rw-guide-summary');
+        const kindLabel = entry.kind === 'author-claim' ? '作者主张 · AI 整理'
+          : entry.kind === 'researcher-prompt' ? '研究者提示 · AI 概括' : 'AI 概括';
+        ai.append(el(document, 'span', 'rw-origin-label rw-ai-label', kindLabel));
+        ai.append(document.createTextNode(entry.text));
+        card.append(ai);
+        const evidence = entry.kind === 'researcher-prompt' ? entry.basedOn : entry.evidence;
+        for (const source of Array.isArray(evidence) ? evidence : []) {
+          if (!source || typeof source.quote !== 'string' || !source.quote.trim()) continue;
+          const quote = el(document, 'blockquote', 'rw-guide-evidence');
+          quote.append(el(document, 'span', 'rw-origin-label', '原文证据'));
+          quote.append(el(document, 'p', '', source.quote));
+          const rawPage = Number.isInteger(source.page) && source.page > 0 ? source.page - 1 : null;
+          const jump = pageButton(result.library, result.itemKey, result.attachmentKey, rawPage);
+          if (jump) quote.append(jump);
+          card.append(quote);
+        }
+      }
+      for (const gap of group.gaps) card.append(el(document, 'p', 'rw-guide-gap', `缺口：${gap}`));
+      section.append(card);
+    }
+    return section;
+  }
+
+  function translationPageIndex(page, index) {
+    return Number.isInteger(page?.pageIndex) && page.pageIndex >= 0 ? page.pageIndex : index;
+  }
+
+  function translationPageOriginal(page) {
+    return typeof page?.original === 'string' ? page.original : '';
+  }
+
+  function translationPageText(page) {
+    return typeof page?.translation === 'string' ? page.translation : '';
+  }
+
+  function translationIsComplete(result, pages) {
+    const isSha256 = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+    if (result?.format !== 'zotero-workbench/translation' || result.version !== 1
+        || result.targetLanguage !== 'zh-CN' || !isSha256(result.sha256)
+        || result.coverage?.complete !== true || !Number.isInteger(result.coverage.pages)
+        || !Number.isInteger(result.coverage.blocks) || pages.length !== result.coverage.pages || !pages.length) return false;
+    const blocks = [];
+    for (const [index, page] of pages.entries()) {
+      if (page?.page !== index + 1 || page.pageIndex !== index || typeof page.url !== 'string'
+          || !page.url.startsWith('zotero://') || !Array.isArray(page.blocks) || !page.blocks.length
+          || !page.original?.trim() || !page.translation?.trim()) return false;
+      if (page.original !== page.blocks.map(block => block?.original || '').join('')
+          || page.translation !== page.blocks.map(block => block?.translation || '').join('')) return false;
+      if (page.blocks.some(block => !block || typeof block.blockId !== 'string'
+          || !isSha256(block.originalFingerprint) || typeof block.original !== 'string' || !block.original.length
+          || typeof block.translation !== 'string' || !block.translation.length || typeof block.unchanged !== 'boolean')) return false;
+      blocks.push(...page.blocks);
+    }
+    return blocks.length === result.coverage.blocks;
+  }
+
+  function translationMarkdown(result) {
+    const pages = Array.isArray(result?.pages) ? result.pages : [];
+    const complete = translationIsComplete(result, pages);
+    const lines = [`# ${text(result?.title, '全文翻译')}`, '', complete ? '> 全文翻译结果。' : '> 翻译结果尚未完整，仅包含当前已返回的页面。', ''];
+    pages.forEach((page, index) => {
+      const pageNumber = translationPageIndex(page, index) + 1;
+      lines.push(`## PDF 第 ${pageNumber} 页`, '', translationPageText(page), '');
+      if (typeof page.url === 'string' && page.url.startsWith('zotero://'))
+        lines.push(`[回到原文第 ${pageNumber} 页](${markdownUrl(page.url)})`, '');
+    });
+    return lines.join('\n');
+  }
+
+  function copyTranslation(result) {
+    state.copyMessage = '';
+    const clipboard = document.defaultView.navigator?.clipboard;
+    if (!clipboard?.writeText) {
+      state.copyMessage = '当前环境无法访问剪贴板。';
+      render();
+      return;
+    }
+    clipboard.writeText(translationMarkdown(result)).then(() => {
+      if (disposed) return;
+      state.copyMessage = '已复制翻译 Markdown 与页码回链。';
+      render();
+    }).catch(error => {
+      if (disposed) return;
+      state.copyMessage = `复制失败：${error?.message || String(error)}`;
+      render();
+    });
+  }
+
+  function renderTranslationResult(result) {
+    const pages = Array.isArray(result.pages) ? result.pages : [];
+    const complete = translationIsComplete(result, pages);
+    const panel = el(document, 'section', 'rw-translation-result');
+    const heading = el(document, 'div', 'rw-section-heading');
+    heading.append(el(document, 'h2', '', result.title || '全文翻译结果'));
+    heading.append(badge('状态', complete ? '全文已译' : '结果未完整', complete ? 'success' : 'error'));
+    heading.append(button('复制译文 Markdown', 'rw-button rw-button-muted', () => copyTranslation(result)));
+    panel.append(heading);
+    panel.append(el(document, 'p', 'rw-muted', '按 PDF 页码逐页对照；译文为机器翻译，原文保留供核验，不自动加入写作证据。'));
+    if (!complete) panel.append(el(document, 'p', 'rw-alert', '当前任务结果没有达到完整翻译标准，不能视为整篇已译。'));
+    if (typeof result.sha256 === 'string') {
+      const fingerprint = el(document, 'details', 'rw-provenance');
+      fingerprint.append(el(document, 'summary', '', 'PDF 来源指纹'));
+      fingerprint.append(el(document, 'p', 'rw-muted rw-fingerprint', result.sha256));
+      panel.append(fingerprint);
+    }
+    if (state.copyMessage) panel.append(el(document, 'p', 'rw-copy-message', state.copyMessage));
+    const modes = el(document, 'nav', 'rw-translation-modes');
+    for (const [mode, label] of [['parallel', '对照'], ['original', '原文'], ['chinese', '中文']]) {
+      modes.append(button(label, `rw-pill${state.translationDisplay === mode ? ' is-active' : ''}`, () => {
+        state.translationDisplay = mode;
+        persistReaderState();
+        render();
+      }, { pressed: state.translationDisplay === mode }));
+    }
+    panel.append(modes);
+    pages.forEach((page, index) => {
+      const pageIndex = translationPageIndex(page, index);
+      const pageBox = el(document, 'article', 'rw-translation-page');
+      const meta = el(document, 'div', 'rw-fold-unit-meta');
+      meta.append(el(document, 'strong', '', `PDF 第 ${pageIndex + 1} 页`));
+      const jump = button(`PDF 第 ${pageIndex + 1} 页`, 'rw-page-button', () => requestRead({
+        library: result.library,
+        itemKey: result.itemKey,
+        attachmentKey: result.attachmentKey,
+        pageIndex,
+        url: page.url,
+      }));
+      if (jump) meta.append(jump);
+      pageBox.append(meta);
+      const original = translationPageOriginal(page);
+      const translated = translationPageText(page);
+      if (state.translationDisplay !== 'chinese') {
+        const block = el(document, 'section', 'rw-translation-block rw-translation-original');
+        block.append(el(document, 'span', 'rw-origin-label', 'PDF 原文'));
+        block.append(el(document, 'p', 'rw-translation-text', original));
+        pageBox.append(block);
+      }
+      if (state.translationDisplay !== 'original') {
+        const block = el(document, 'section', 'rw-translation-block rw-translation-chinese');
+        if (Array.isArray(page.blocks) && page.blocks.length) {
+          for (const translationBlock of page.blocks) {
+            const segment = el(document, 'div', `rw-translation-segment${translationBlock.unchanged ? ' is-preserved' : ''}`);
+            segment.append(el(document, 'span', translationBlock.unchanged ? 'rw-origin-label' : 'rw-origin-label rw-machine-label',
+              translationBlock.unchanged ? '原文保留' : '机器译文'));
+            segment.append(el(document, 'p', 'rw-translation-text', translationBlock.translation));
+            block.append(segment);
+          }
+        } else {
+          block.append(el(document, 'span', 'rw-origin-label rw-machine-label', '机器译文'));
+          block.append(el(document, 'p', 'rw-translation-text', translated || '本页译文未返回。'));
+        }
+        pageBox.append(block);
+      }
+      pageBox.dataset.pageIndex = String(pageIndex);
+      panel.append(pageBox);
+    });
+    return panel;
+  }
+
+  function renderTranslationView() {
+    const body = el(document, 'main', 'rw-body');
+    body.append(el(document, 'p', 'rw-muted', '选择单篇文献生成逐页中文翻译。原文、中文和对照视图独立于 TextFold；不排版成 PDF。'));
+    if (state.result && state.job?.kind === 'translate') body.append(renderTranslationResult(state.result));
+    if (state.papers.length) {
+      const papers = el(document, 'div', 'rw-fold-paper-list');
+      for (const paper of state.papers) {
+        const row = el(document, 'div', 'rw-fold-paper-row');
+        row.append(el(document, 'div', 'rw-fold-paper-title', paper.title || paper.itemKey));
+        row.append(button('全文翻译', 'rw-button rw-button-primary', () => startJob('translate', {
+          kind: 'translate', library, key: paper.itemKey,
+        }), { disabled: Boolean(state.job && !TERMINAL.has(state.job.status)) }));
+        papers.append(row);
+      }
+      body.append(papers);
+    } else if (!state.loading) body.append(el(document, 'p', 'rw-empty', '先从文库选择一篇文献或一个分类。'));
+    if (state.readError) body.append(el(document, 'p', 'rw-alert', state.readError));
+    return body;
+  }
+
   function render() {
     if (disposed) return;
-    app.replaceChildren(renderTop(), state.view === 'fold' ? renderFoldView() : renderAnnotations());
+    const scrollPositions = [];
+    for (let node = host; node; node = node.parentNode) {
+      if (typeof node.scrollTop === 'number' && typeof node.scrollLeft === 'number') {
+        scrollPositions.push([node, node.scrollTop, node.scrollLeft]);
+      }
+    }
+    const view = document.defaultView;
+    const windowPosition = view && Number.isFinite(view.scrollY)
+      ? [view.scrollX || 0, view.scrollY] : null;
+    app.replaceChildren(renderTop(), state.view === 'fold' ? renderFoldView()
+      : state.view === 'translation' ? renderTranslationView() : renderAnnotations());
+    for (const [node, top, left] of scrollPositions) {
+      node.scrollTop = top;
+      node.scrollLeft = left;
+    }
+    if (windowPosition && typeof view.scrollTo === 'function') view.scrollTo(...windowPosition);
   }
 
   render();
@@ -1115,6 +2063,7 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
 
   return () => {
     if (disposed) return;
+    stopAnnotationTranslationQueue({ cancelActive: false, render: false });
     disposed = true;
     loadEpoch += 1;
     jobEpoch += 1;

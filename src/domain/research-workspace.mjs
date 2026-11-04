@@ -1,11 +1,17 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { libraryPrefix, ZoteroSession } from '../../dist/runtime.mjs';
+import {
+  buildTranslationBlocks, MAX_ANNOTATION_TRANSLATION_BATCH, MAX_ANNOTATION_TRANSLATION_CHARS,
+  runTranslationWorker, TranslationWorkerError, TRANSLATION_TARGET_LANGUAGE, TRANSLATION_VERSION,
+  translationCacheKey, validateTranslationOutput
+} from './translation-worker.mjs';
+import { configuredResearchModel, ResearchModelConfigError } from './research-model-config.mjs';
 import { scopeKeys } from './evidence.mjs';
 import { annotationLink } from './library.mjs';
 import { installPagination } from '../transports/zotero-local.mjs';
@@ -18,8 +24,20 @@ const keyPattern = /^[A-Z0-9]{8}$/;
 const libraryPattern = /^(user|g[1-9]\d{0,19})$/;
 const sourceIdPattern = /^[a-f0-9]{16}$/;
 const fingerprintPattern = /^[a-f0-9]{64}$/;
+const researchModelPattern = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$/;
 const jobIdPattern = /^[a-f0-9]{24}$/;
 const terminalStatuses = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
+export const RESEARCH_GUIDE_PROFILE_ID = 'social-science-general';
+export const RESEARCH_GUIDE_PROFILE_VERSION = '1';
+const guideSections = [
+  ['researchQuestion', '研究问题'],
+  ['argument', '论证主线'],
+  ['concepts', '核心概念'],
+  ['methods', '方法与证据'],
+  ['findings', '发现与边界'],
+  ['limitations', '文献对话与迁移边界'],
+];
+const kanaOrHangul = /[\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
 const own = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
 const isRecord = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 
@@ -65,7 +83,36 @@ function safeReadError() {
 
 function safeJobError(error) {
   if (error instanceof ResearchWorkspaceError) return error.message;
+  if (error instanceof TranslationWorkerError) return error.message;
+  if (error instanceof ResearchModelConfigError) return error.message;
   return '研究任务未能完成；未保存不完整结果。';
+}
+
+function safeAnnotationTags(rawTags) {
+  if (!Array.isArray(rawTags)) return [];
+  const tags = [];
+  const seen = new Set();
+  for (const entry of rawTags) {
+    const raw = typeof entry === 'string' ? entry : entry && typeof entry.tag === 'string' ? entry.tag : '';
+    const tag = raw.trim();
+    if (!tag || tag.length > 256 || /[\u0000-\u001f\u007f]/u.test(tag) || seen.has(tag)) continue;
+    seen.add(tag);
+    tags.push({ tag });
+    if (tags.length >= 100) break;
+  }
+  return tags;
+}
+
+function translationModelProvenance(rows) {
+  const groups = new Map();
+  for (const row of rows) {
+    if (typeof row.model !== 'string' || !researchModelPattern.test(row.model)) continue;
+    if (!groups.has(row.model)) groups.set(row.model, []);
+    groups.get(row.model).push(row.id ?? row.blockId ?? row.sourceId);
+  }
+  if (groups.size === 1) return { model: groups.keys().next().value };
+  if (groups.size > 1) return { models: [...groups].map(([model, ids]) => ({ model, ids })) };
+  return {};
 }
 
 export function noteText(html) {
@@ -112,6 +159,7 @@ export function materialRecord({ library, itemKey, title, raw, attachmentKey }) 
     pageIndex,
     pageLabel: typeof d.annotationPageLabel === 'string' ? d.annotationPageLabel : '',
     color: typeof d.annotationColor === 'string' ? d.annotationColor : '',
+    tags: safeAnnotationTags(d.tags),
     url,
     modified: typeof d.dateModified === 'string' ? d.dateModified : '',
     origin: 'not-inferred',
@@ -157,13 +205,18 @@ export function validateDraft(draft, sources) {
   if (draft.gaps !== undefined && (!Array.isArray(draft.gaps) || draft.gaps.length > 100 ||
       draft.gaps.some(gap => typeof gap !== 'string' || gap.length > 2000)))
     throw failure('AI 返回的证据缺口格式无效；未保存初稿。');
+  if (draft.provenance !== undefined && (!isRecord(draft.provenance) ||
+      Object.keys(draft.provenance).length !== 1 || typeof draft.provenance.model !== 'string' ||
+      !researchModelPattern.test(draft.provenance.model)))
+    throw failure('AI 返回的模型来源信息无效；未保存初稿。');
   return {
     title: typeof draft.title === 'string' ? draft.title : '',
     paragraphs,
     gaps: draft.gaps || [],
     sources,
     reviewStatus: 'human-review-required',
-    basis: 'human-selected-notes-only'
+    basis: 'human-selected-notes-only',
+    ...(draft.provenance ? { provenance: { model: draft.provenance.model } } : {})
   };
 }
 
@@ -201,6 +254,51 @@ export function validateFoldResult(result, payload) {
   }
   if (seen.size !== pages.length || units !== result.coverage.units)
     throw failure('TextFold 页码或段落覆盖不完整，未保存局部结果。');
+  validateResearchGuide(result.researchGuide, pages, payload.researchGuideProfile);
+  return result;
+}
+
+function validateGuideCitations(value, pages, label) {
+  if (!Array.isArray(value) || !value.length || value.length > 4)
+    throw failure(`${label}缺少可核对的原文依据；未保存研究导读。`);
+  return value.map(citation => {
+    if (!isRecord(citation) || Object.keys(citation).some(key => !['page', 'quote'].includes(key)) ||
+        !Number.isInteger(citation.page) || citation.page < 1 || citation.page > pages.length ||
+        typeof citation.quote !== 'string' || citation.quote.length < 12 || citation.quote.length > 800 ||
+        !pages[citation.page - 1].text.includes(citation.quote))
+      throw failure(`${label}页码或逐字引文未通过原文核验；未保存研究导读。`);
+    return { page: citation.page, quote: citation.quote };
+  });
+}
+
+export function validateResearchGuide(guide, pages, profile = {
+  profileId: RESEARCH_GUIDE_PROFILE_ID,
+  profileVersion: RESEARCH_GUIDE_PROFILE_VERSION,
+}) {
+  if (!isRecord(guide) || guide.profileId !== profile.profileId || guide.profileVersion !== profile.profileVersion)
+    throw failure('研究导读版本或结构无效；未保存全文结果。');
+  const expectedKeys = ['profileId', 'profileVersion', ...guideSections.map(([id]) => id)];
+  if (Object.keys(guide).length !== expectedKeys.length || Object.keys(guide).some(key => !expectedKeys.includes(key)))
+    throw failure('研究导读结构不完整；未保存全文结果。');
+  const result = { profileId: profile.profileId, profileVersion: profile.profileVersion };
+  for (const [id, title] of guideSections) {
+    const section = guide[id];
+    if (!isRecord(section) || Object.keys(section).some(key => !['items', 'gaps'].includes(key)) ||
+        !Array.isArray(section.items) || section.items.length > 24 ||
+        !Array.isArray(section.gaps) || section.gaps.length > 12 ||
+        section.gaps.some(gap => typeof gap !== 'string' || !gap.trim() || gap.length > 800))
+      throw failure(`研究导读“${title}”结构无效；未保存全文结果。`);
+    const items = section.items.map(item => {
+      if (!isRecord(item) || typeof item.text !== 'string' || !item.text.trim() || item.text.length > 1500)
+        throw failure(`研究导读“${title}”条目格式无效；未保存全文结果。`);
+      if (item.kind === 'author-claim' && !Object.keys(item).some(key => !['kind', 'text', 'evidence'].includes(key)))
+        return { kind: item.kind, text: item.text, evidence: validateGuideCitations(item.evidence, pages, title) };
+      if (item.kind === 'researcher-prompt' && !Object.keys(item).some(key => !['kind', 'text', 'basedOn'].includes(key)))
+        return { kind: item.kind, text: item.text, basedOn: validateGuideCitations(item.basedOn, pages, title) };
+      throw failure(`研究导读“${title}”未区分作者主张与研究者提示；未保存全文结果。`);
+    });
+    result[id] = { items, gaps: [...section.gaps] };
+  }
   return result;
 }
 
@@ -221,6 +319,7 @@ export class ResearchWorkspace {
     this.active = new Map();
     this.scopes = new Map();
     this.saveQueues = new Map();
+    this.translationVerificationRetries = new Map();
     this.closed = false;
   }
 
@@ -421,7 +520,117 @@ export class ResearchWorkspace {
     return selected;
   }
 
-  async fulltext(library, key) {
+  validateAnnotationTranslationArgs(rawArgs) {
+    const args = requireRecord(rawArgs);
+    onlyKeys(args, new Set(['library', 'keys', 'sourceIds', 'sourceVersions']));
+    const library = validLibrary(args.library ?? 'user');
+    const keys = validKeyList(args.keys, { min: 1, max: MAX_ANNOTATION_TRANSLATION_BATCH });
+    if (!Array.isArray(args.sourceIds) || !args.sourceIds.length || args.sourceIds.length > MAX_ANNOTATION_TRANSLATION_BATCH ||
+        args.sourceIds.some(id => typeof id !== 'string' || !sourceIdPattern.test(id)) ||
+        new Set(args.sourceIds).size !== args.sourceIds.length)
+      throw new Error(`批注翻译编号无效；请提供 1–${MAX_ANNOTATION_TRANSLATION_BATCH} 条互不重复的高亮或下划线。`);
+    const versions = requireRecord(args.sourceVersions, '批注翻译缺少来源版本校验。');
+    if (Object.keys(versions).length !== args.sourceIds.length || args.sourceIds.some(id =>
+      !own(versions, id) || typeof versions[id] !== 'string' || !fingerprintPattern.test(versions[id])))
+      throw new Error('批注翻译缺少有效来源指纹；请刷新后重试。');
+    return { library, keys, sourceIds: [...args.sourceIds], sourceVersions: { ...versions } };
+  }
+
+  async translationAnnotationSources(rawArgs) {
+    const args = this.validateAnnotationTranslationArgs(rawArgs);
+    let version;
+    try {
+      await this.session.library.checkVersion(args.library);
+      version = String(this.session.library.versionOf(args.library));
+    } catch { throw failure('无法确认 Zotero 文库版本；请刷新后再翻译。'); }
+    const records = [];
+    for (const key of args.keys) {
+      let paper;
+      try { paper = await this.paper(args.library, key); }
+      catch { throw failure('所选文献的高亮或下划线未完整读取；请刷新后再翻译。'); }
+      if (paper.errors.length) throw failure('所选文献的高亮或下划线未完整读取；请刷新后再翻译。');
+      records.push(...paper.records);
+    }
+    let currentVersion;
+    try {
+      await this.session.library.checkVersion(args.library);
+      currentVersion = String(this.session.library.versionOf(args.library));
+    } catch { throw failure('无法确认 Zotero 文库版本；请刷新后再翻译。'); }
+    if (currentVersion !== version) throw failure('文库在读取期间发生变化；请刷新后再翻译。');
+    const selected = args.sourceIds.map(sourceId => {
+      const record = records.find(candidate => candidate.id === sourceId);
+      if (!record) throw failure('所选高亮或下划线已删除或变更；请刷新后再翻译。');
+      if (record.fingerprint !== args.sourceVersions[sourceId])
+        throw failure('所选高亮或下划线内容已变化；请刷新后再翻译。');
+      if (!['highlight', 'underline'].includes(record.kind))
+        throw failure('自动翻译仅支持高亮或下划线摘录，不翻译笔记或其他批注。');
+      if (!record.text.trim() || !record.attachmentKey || !Number.isInteger(record.pageIndex) || record.pageIndex < 0)
+        throw failure('所选摘录缺少可回链 PDF 页码或原文。');
+      if (record.text.length > MAX_ANNOTATION_TRANSLATION_CHARS)
+        throw failure(`单条外文摘录超过 ${MAX_ANNOTATION_TRANSLATION_CHARS} 字符上限；未截断翻译。`);
+      const letters = [...record.text.matchAll(/\p{L}/gu)].length;
+      const han = [...record.text.matchAll(/\p{Script=Han}/gu)].length;
+      if (!kanaOrHangul.test(record.text) && han && han / Math.max(letters, 1) >= 0.5)
+        throw failure('中文为主的高亮或下划线不进入外文自动翻译；含外文的混合摘录可单条手动翻译。');
+      return {
+        sourceId: record.id,
+        fingerprint: record.fingerprint,
+        originalFingerprint: hash(record.text),
+        original: record.text,
+        kind: record.kind,
+        pageIndex: record.pageIndex,
+        page: record.pageIndex + 1,
+        url: record.url,
+        library: record.library,
+        itemKey: record.itemKey,
+        attachmentKey: record.attachmentKey,
+      };
+    });
+    return { ...args, sources: selected };
+  }
+
+  async readTranslationCache(originalFingerprint) {
+    const key = translationCacheKey(originalFingerprint);
+    try {
+      const entry = JSON.parse(await readFile(join(this.dir, 'translation-cache', `${key}.json`), 'utf8'));
+      if (!isRecord(entry) || entry.key !== key || entry.targetLanguage !== TRANSLATION_TARGET_LANGUAGE ||
+          entry.translationVersion !== TRANSLATION_VERSION || entry.originalFingerprint !== originalFingerprint ||
+          typeof entry.translation !== 'string' || !entry.translation.trim()) return null;
+      return {
+        translation: entry.translation,
+        model: typeof entry.model === 'string' && researchModelPattern.test(entry.model) ? entry.model : null
+      };
+    } catch { return null; }
+  }
+
+  async saveTranslationCache(entries) {
+    if (!entries.length) return;
+    const directory = join(this.dir, 'translation-cache');
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    await chmod(directory, 0o700);
+    for (const entry of entries) {
+      const key = translationCacheKey(entry.originalFingerprint);
+      const path = join(directory, `${key}.json`);
+      const temporary = `${path}.${randomBytes(8).toString('hex')}.tmp`;
+      const value = {
+        key,
+        targetLanguage: TRANSLATION_TARGET_LANGUAGE,
+        translationVersion: TRANSLATION_VERSION,
+        originalFingerprint: entry.originalFingerprint,
+        translation: entry.translation,
+        ...(typeof entry.model === 'string' && researchModelPattern.test(entry.model) ? { model: entry.model } : {}),
+      };
+      try {
+        await writeFile(temporary, JSON.stringify(value), { mode: 0o600, flag: 'wx' });
+        await rename(temporary, path);
+      } catch (error) {
+        await rm(temporary, { force: true }).catch(() => {});
+        throw failure('无法安全保存本机翻译缓存；未报告任务完成。');
+      }
+    }
+  }
+
+  async fulltext(library, key, { allowPdfJsFallback = false } = {}) {
     validLibrary(library);
     validItemKey(key);
     let source;
@@ -437,37 +646,61 @@ export class ResearchWorkspace {
     try { before = await readFile(path); }
     catch { throw failure('PDF 文件不可读取；未启动 AI。'); }
     const fingerprint = hash(before);
-    let stdout;
+    let stdout = '';
+    let textSource = 'poppler';
+    let extracted;
     try {
       ({ stdout } = await promisify(execFile)(process.env.PDFTOTEXT_PATH || 'pdftotext',
         ['-enc', 'UTF-8', path, '-'], { timeout: 120000, maxBuffer: 16 * 1024 * 1024 }));
-    } catch { throw failure('PDF 全文提取失败；未启动 AI。'); }
-    const texts = stdout.replace(/\r\n?/g, '\n').split('\f');
-    if (texts.at(-1)?.trim() === '') texts.pop();
-    if (texts.length !== pages.length) throw failure('全文提取页数不一致，未启动 AI。');
-    const extracted = texts.map((text, index) => ({ page: index + 1, text: text.trim() }));
-    if (extracted.some(page => page.text.replace(/\s/g, '').length < 15))
-      throw failure('有页面缺少可读取文字，可能是扫描页或图表页。请先完成 OCR；未将部分内容冒充全文。');
-    if (stdout.length > 160000) throw failure('全文超过当前模型流程的 16 万字符上限，未截断生成。');
+    } catch (error) {
+      if (!allowPdfJsFallback || error?.code !== 'ENOENT')
+        throw failure('PDF 全文提取失败；未启动 AI。');
+      textSource = 'pdfjs';
+      if (pages.length > 200 || pages.some(page => typeof page?.text !== 'string'))
+        throw failure('PDF.js 未返回完整逐页文本；未启动翻译。');
+      extracted = pages.map((page, index) => ({ page: index + 1, text: page.text.trim() }));
+      const invalidPage = extracted.find(page => {
+        const characters = [...page.text].filter(character => !/\s/u.test(character));
+        const words = [...page.text.matchAll(/[\p{L}\p{N}]/gu)].length;
+        const replacement = [...page.text].filter(character => character === '\uFFFD').length;
+        const controls = [...page.text].filter(character => /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(character)).length;
+        return characters.length < 15 || words < 15 || words / characters.length < 0.2 || replacement > 0 || controls > 0;
+      });
+      if (invalidPage) throw failure(`PDF.js 第 ${invalidPage.page} 页文本缺失或明显乱码；未将局部内容冒充全文翻译。`);
+    }
+    if (textSource === 'poppler') {
+      const texts = stdout.replace(/\r\n?/g, '\n').split('\f');
+      if (texts.at(-1)?.trim() === '') texts.pop();
+      if (texts.length !== pages.length) throw failure('全文提取页数不一致，未启动 AI。');
+      extracted = texts.map((text, index) => ({ page: index + 1, text: text.trim() }));
+      if (extracted.some(page => page.text.replace(/\s/g, '').length < 15))
+        throw failure('有页面缺少可读取文字，可能是扫描页或图表页。请先完成 OCR；未将部分内容冒充全文。');
+      if (stdout.length > 160000) throw failure('全文超过当前模型流程的 16 万字符上限，未截断生成。');
+    }
+    if (extracted.reduce((total, page) => total + page.text.length, 0) > 160000)
+      throw failure('全文超过当前模型流程的 16 万字符上限，未截断生成。');
     let after;
     try { after = await readFile(path); }
     catch { throw failure('PDF 在全文提取期间不可读取；未启动 AI。'); }
     if (hash(after) !== fingerprint) throw failure('PDF 在全文提取期间发生变化；请重新读取。');
+    const title = [item.title, item.data?.title, attachment.title, attachment.data?.title]
+      .find(value => typeof value === 'string' && value.trim()) || key;
     return {
-      title: typeof item.title === 'string' && item.title ? item.title : (attachment.title || key),
+      title,
       itemKey: item.key,
       attachmentKey: attachment.key,
       library,
       pages: extracted,
       sha256: fingerprint,
-      sourcePath: path
+      sourcePath: path,
+      textSource
     };
   }
 
   validateStartArgs(rawArgs) {
     const args = requireRecord(rawArgs);
     onlyKeys(args, new Set(['kind', 'library', 'key', 'keys', 'sourceIds', 'sourceVersions', 'purpose', 'framework']));
-    if (!['fold', 'draft'].includes(args.kind)) throw new Error('无效任务。');
+    if (!['fold', 'draft', 'translate', 'translate_annotations'].includes(args.kind)) throw new Error('无效任务。');
     if (args.kind === 'fold') {
       const library = validLibrary(args.library ?? 'user');
       const key = validItemKey(args.key);
@@ -478,6 +711,16 @@ export class ResearchWorkspace {
         throw new Error('任务参数无效。');
       return { kind: 'fold', library, key };
     }
+    if (args.kind === 'translate') {
+      onlyKeys(args, new Set(['kind', 'library', 'key']));
+      return { kind: 'translate', library: validLibrary(args.library ?? 'user'), key: validItemKey(args.key) };
+    }
+    if (args.kind === 'translate_annotations') {
+      onlyKeys(args, new Set(['kind', 'library', 'keys', 'sourceIds', 'sourceVersions']));
+      return { kind: 'translate_annotations', ...this.validateAnnotationTranslationArgs({
+        library: args.library, keys: args.keys, sourceIds: args.sourceIds, sourceVersions: args.sourceVersions
+      }) };
+    }
     if (args.key !== undefined) throw new Error('标注写作必须提供研究者选定的材料编号。');
     const { kind, ...writingArgs } = args;
     return { kind, ...this.validateWritingArgs(writingArgs) };
@@ -486,7 +729,10 @@ export class ResearchWorkspace {
   async start(rawArgs) {
     const args = this.validateStartArgs(rawArgs);
     await this.ready();
-    const signature = hash(args);
+    const signature = hash(args.kind === 'fold' ? {
+      ...args,
+      researchGuideProfile: { profileId: RESEARCH_GUIDE_PROFILE_ID, profileVersion: RESEARCH_GUIDE_PROFILE_VERSION }
+    } : args);
     for (const job of this.active.values()) if (job.signature === signature) return this.public(job);
     if (this.active.size >= 2) throw new Error('已有两项任务执行中，请等待完成。');
     const id = randomBytes(12).toString('hex');
@@ -520,43 +766,50 @@ export class ResearchWorkspace {
   async run(job, args) {
     const scratch = join(this.dir, job.id);
     try {
-      let payload;
-      if (args.kind === 'fold') payload = { kind: 'fold', ...await this.fulltext(args.library, args.key) };
-      else {
+      if (args.kind === 'translate') {
+        await this.runFulltextTranslation(job, args, scratch);
+      } else if (args.kind === 'translate_annotations') {
+        await this.runAnnotationTranslation(job, args, scratch);
+      } else {
+        let payload;
+        if (args.kind === 'fold') payload = {
+          kind: 'fold', ...await this.fulltext(args.library, args.key),
+          researchGuideProfile: { profileId: RESEARCH_GUIDE_PROFILE_ID, profileVersion: RESEARCH_GUIDE_PROFILE_VERSION }
+        };
+        else {
         const { kind, ...writingArgs } = args;
         payload = { kind, sources: await this.writingSources(writingArgs), purpose: args.purpose, framework: args.framework };
-      }
-      if (job.status !== 'running') return;
-      job.stage = args.kind === 'fold' ? 'AI 通读全文' : 'AI 阅读所选标注';
-      await this.persist(job);
-      await mkdir(scratch, { recursive: false, mode: 0o700 });
-      const progress = async update => {
-        if (job.status !== 'running' || !isRecord(update)) return;
-        if (typeof update.stage === 'string' && update.stage.length <= 160) job.stage = update.stage;
-        if (Number.isFinite(update.progress)) job.progress = Math.max(0, Math.min(99, Math.floor(update.progress)));
+        }
+        if (job.status !== 'running') return;
+        job.stage = args.kind === 'fold' ? 'AI 通读全文' : 'AI 阅读所选标注';
         await this.persist(job);
-      };
-      let result;
-      if (this.runner) {
-        try { result = await this.runner(payload, progress); }
-        catch { throw failure('AI 调用失败，未生成完整结果。'); }
-      } else result = await this.spawnWorker(job, payload, scratch, progress);
-      if (job.status !== 'running') return;
-      if (args.kind === 'draft') job.result = validateDraft(result, payload.sources);
-      else {
-        validateFoldResult(result, payload);
-        let current;
-        try { current = await readFile(payload.sourcePath); }
-        catch { throw failure('生成期间无法确认 PDF 版本；未保存结果。'); }
-        if (hash(current) !== payload.sha256) throw failure('生成期间 PDF 已变更，请重新生成。');
-        job.result = {
-          ...result,
-          library: payload.library,
-          itemKey: payload.itemKey,
-          attachmentKey: payload.attachmentKey,
-          sha256: payload.sha256
+        await mkdir(scratch, { recursive: false, mode: 0o700 });
+        const progress = async update => {
+          if (job.status !== 'running' || !isRecord(update)) return;
+          if (typeof update.stage === 'string' && update.stage.length <= 160) job.stage = update.stage;
+          if (Number.isFinite(update.progress)) job.progress = Math.max(0, Math.min(99, Math.floor(update.progress)));
+          await this.persist(job);
         };
+        let result;
+        if (this.runner) {
+          try { result = await this.runner(payload, progress); }
+          catch { throw failure('AI 调用失败，未生成完整结果。'); }
+        } else result = await this.spawnWorker(job, payload, scratch, progress);
+        if (job.status !== 'running') return;
+        if (args.kind === 'draft') job.result = validateDraft(result, payload.sources);
+        else {
+          validateFoldResult(result, payload);
+          await this.assertPdfUnchanged(payload);
+          job.result = {
+            ...result,
+            library: payload.library,
+            itemKey: payload.itemKey,
+            attachmentKey: payload.attachmentKey,
+            sha256: payload.sha256
+          };
+        }
       }
+      if (job.status !== 'running') return;
       job.status = 'completed';
       job.stage = '已完成';
       job.progress = 100;
@@ -575,7 +828,171 @@ export class ResearchWorkspace {
     }
   }
 
-  spawnWorker(job, payload, scratch, progress) {
+  async progress(job, update) {
+    if (job.status !== 'running' || !isRecord(update)) return;
+    if (typeof update.stage === 'string' && update.stage.length <= 160) job.stage = update.stage;
+    if (Number.isFinite(update.progress)) job.progress = Math.max(0, Math.min(99, Math.floor(update.progress)));
+    await this.persist(job);
+  }
+
+  async assertPdfUnchanged(payload) {
+    let current;
+    try { current = await readFile(payload.sourcePath); }
+    catch { throw failure('生成期间无法确认 PDF 版本；未保存结果。'); }
+    if (hash(current) !== payload.sha256) throw failure('生成期间 PDF 已变更，请重新生成。');
+  }
+
+  async executeTranslations(job, payload, scratch, progress, model) {
+    const items = payload?.kind === 'translate' ? payload.blocks : payload?.sources;
+    if (!items?.length) return [];
+    let response;
+    if (this.runner) {
+      try { response = await this.runner(payload, progress); }
+      catch { throw failure('AI 翻译失败；未缓存不完整结果。'); }
+    } else {
+      try { response = await runTranslationWorker({ job, payload, scratch, progress, model }); }
+      catch (error) {
+        throw failure(error instanceof TranslationWorkerError || error instanceof ResearchModelConfigError
+          ? error.message : 'AI 翻译失败；未缓存不完整结果。');
+      }
+    }
+    try { return validateTranslationOutput(payload, response); }
+    catch (error) {
+      throw failure(error instanceof TranslationWorkerError ? error.message : '翻译覆盖或结果格式无效；未缓存不完整结果。');
+    }
+  }
+
+  async runFulltextTranslation(job, args, scratch) {
+    const model = await configuredResearchModel({ stateRoot: dirname(this.dir) });
+    const source = await this.fulltext(args.library, args.key, { allowPdfJsFallback: true });
+    const blocks = buildTranslationBlocks(source.pages).map(block => ({
+      ...block, originalFingerprint: hash(block.original)
+    }));
+    const translations = new Map();
+    const missing = [];
+    for (const block of blocks) {
+      const cached = await this.readTranslationCache(block.originalFingerprint);
+      if (cached) translations.set(block.id, { id: block.id, translation: cached.translation,
+        unchanged: cached.translation === block.original, model: cached.model });
+      else if (block.preserveOriginal) translations.set(block.id, {
+        id: block.id, translation: block.original, unchanged: true
+      });
+      else missing.push(block);
+    }
+    const modelPayload = {
+      kind: 'translate',
+      blocks: missing.map(({ id, original, preserveOriginal }) => ({ id, original, preserveOriginal }))
+    };
+    await this.progress(job, { stage: '准备全文分块', progress: 2 });
+    await mkdir(scratch, { recursive: false, mode: 0o700 });
+    const translated = await this.executeTranslations(job, modelPayload, scratch,
+      update => this.progress(job, update), model);
+    for (const row of translated) translations.set(row.id, { ...row, model });
+    if (job.status !== 'running') return;
+    await this.assertPdfUnchanged(source);
+    const missingCache = translated.filter(row => !row.unchanged).map(row => {
+      const block = blocks.find(item => item.id === row.id);
+      return { originalFingerprint: block.originalFingerprint, translation: row.translation, model };
+    });
+    const pages = source.pages.map(page => {
+      const pageBlocks = blocks.filter(block => block.page === page.page).map(block => {
+        const row = translations.get(block.id);
+        if (!row) throw failure('全文翻译覆盖不完整；未保存任务结果。');
+        return {
+          blockId: block.id,
+          originalFingerprint: block.originalFingerprint,
+          original: block.original,
+          translation: row.translation,
+          unchanged: row.unchanged === true,
+          ...(row.model ? { model: row.model } : {}),
+        };
+      });
+      return {
+        page: page.page,
+        pageIndex: page.page - 1,
+        url: `zotero://open-pdf/${source.library === 'user' ? 'library' : `groups/${source.library.slice(1)}`}/items/${source.attachmentKey}?page=${page.page}`,
+        original: pageBlocks.map(block => block.original).join(''),
+        translation: pageBlocks.map(block => block.translation).join(''),
+        blocks: pageBlocks,
+      };
+    });
+    const blockCount = blocks.length;
+    if (pages.length !== source.pages.length || pages.some(page => !page.blocks.length) ||
+        pages.flatMap(page => page.blocks).length !== blockCount || translations.size !== blockCount)
+      throw failure('全文翻译覆盖不完整；未保存任务结果。');
+    await this.saveTranslationCache(missingCache);
+    job.result = {
+      format: 'zotero-workbench/translation', version: 1, targetLanguage: TRANSLATION_TARGET_LANGUAGE,
+      title: source.title, library: source.library, itemKey: source.itemKey, attachmentKey: source.attachmentKey,
+      sha256: source.sha256, textSource: source.textSource, pages,
+      coverage: { complete: true, pages: pages.length, blocks: blockCount },
+      provenance: { translationVersion: TRANSLATION_VERSION, textSource: source.textSource,
+        ...translationModelProvenance(pages.flatMap(page => page.blocks)) }
+    };
+  }
+
+  async runAnnotationTranslation(job, args, scratch) {
+    const model = await configuredResearchModel({ stateRoot: dirname(this.dir) });
+    const { kind: _kind, ...sourceArgs } = args;
+    const sourceSet = await this.translationAnnotationSources(sourceArgs);
+    const translations = new Map();
+    const missing = [];
+    for (const source of sourceSet.sources) {
+      const cached = await this.readTranslationCache(source.originalFingerprint);
+      if (cached) translations.set(source.sourceId, { id: source.sourceId, translation: cached.translation,
+        unchanged: false, model: cached.model });
+      else missing.push(source);
+    }
+    const modelPayload = {
+      kind: 'translate_annotations',
+      sources: missing.map(source => ({ id: source.sourceId, original: source.original }))
+    };
+    await this.progress(job, { stage: '核对所选高亮和下划线', progress: 2 });
+    await mkdir(scratch, { recursive: false, mode: 0o700 });
+    const translated = await this.executeTranslations(job, modelPayload, scratch,
+      update => this.progress(job, update), model);
+    for (const row of translated) translations.set(row.id, { ...row, model });
+    if (job.status !== 'running') return;
+    // Re-read and fingerprint every current Zotero annotation after the model call before caching.
+    await this.translationAnnotationSources(sourceArgs);
+    const missingCache = translated.map(row => {
+      const source = sourceSet.sources.find(item => item.sourceId === row.id);
+      return { originalFingerprint: source.originalFingerprint, translation: row.translation, model };
+    });
+    const resultRows = sourceSet.sources.map(source => {
+      const row = translations.get(source.sourceId);
+      if (!row) throw failure('批注翻译覆盖不完整；未保存任务结果。');
+      return {
+        sourceId: source.sourceId, fingerprint: source.fingerprint,
+        originalFingerprint: source.originalFingerprint, original: source.original,
+        translation: row.translation, kind: source.kind, pageIndex: source.pageIndex,
+        ...(row.model ? { model: row.model } : {}),
+        page: source.page, url: source.url, library: source.library,
+        itemKey: source.itemKey, attachmentKey: source.attachmentKey,
+      };
+    });
+    if (resultRows.length !== sourceSet.sourceIds.length || translations.size !== resultRows.length)
+      throw failure('批注翻译覆盖不完整；未保存任务结果。');
+    await this.saveTranslationCache(missingCache);
+    job.result = {
+      format: 'zotero-workbench/annotation-translations', version: 1,
+      targetLanguage: TRANSLATION_TARGET_LANGUAGE, translations: resultRows,
+      coverage: { complete: true, total: resultRows.length },
+      provenance: { translationVersion: TRANSLATION_VERSION, generatedReadOnly: true,
+        ...translationModelProvenance(resultRows) }
+    };
+  }
+
+  async spawnWorker(job, payload, scratch, progress) {
+    let model;
+    try { model = await configuredResearchModel({ stateRoot: dirname(this.dir) }); }
+    catch (error) {
+      if (error instanceof ResearchModelConfigError) throw failure(error.message);
+      throw error;
+    }
+    const childEnv = { ...process.env, PYTHONPATH: join(root, 'vendor/textfold'), PYTHONUNBUFFERED: '1' };
+    if (model) childEnv.ZOTERO_WORKBENCH_RESEARCH_MODEL = model;
+    else delete childEnv.ZOTERO_WORKBENCH_RESEARCH_MODEL;
     return new Promise((resolve, reject) => {
       const python = this.workerPython || process.env.ZOTERO_WORKBENCH_PYTHON || join(root, '.runtime/textfold/bin/python');
       let child;
@@ -584,7 +1001,7 @@ export class ResearchWorkspace {
           cwd: scratch,
           detached: process.platform !== 'win32',
           stdio: ['pipe', 'pipe', 'pipe'],
-          env: { ...process.env, PYTHONPATH: join(root, 'vendor/textfold'), PYTHONUNBUFFERED: '1' }
+          env: childEnv
         });
       } catch {
         reject(failure('TextFold 后台环境无法启动。'));
@@ -677,6 +1094,42 @@ export class ResearchWorkspace {
         job.stage = '已中断';
         job.error = '宿主已退出，任务未完成；可重新生成。';
         await this.save(id, job).catch(() => {});
+      }
+    }
+    if (job.status === 'completed' && ['translate', 'translate_annotations'].includes(job.kind) && job.result) {
+      const retry = this.translationVerificationRetries.get(id);
+      if (retry && retry.nextAttemptAt > Date.now()) return retry.view;
+      try {
+        await this.ready();
+        if (job.kind === 'translate') {
+          if (job.result.format !== 'zotero-workbench/translation' || job.result.version !== 1 ||
+              typeof job.result.library !== 'string' || typeof job.result.itemKey !== 'string' ||
+              typeof job.result.sha256 !== 'string') throw new Error('invalid persisted translation result');
+          const current = await this.fulltext(job.result.library, job.result.itemKey, { allowPdfJsFallback: true });
+          if (current.sha256 !== job.result.sha256) throw new Error('PDF source changed');
+        } else {
+          if (job.result.format !== 'zotero-workbench/annotation-translations' || job.result.version !== 1 ||
+              !Array.isArray(job.result.translations) || !job.result.translations.length) throw new Error('invalid persisted annotation translations');
+          const rows = job.result.translations;
+          const library = rows[0].library;
+          if (rows.some(row => row.library !== library || !sourceIdPattern.test(row.sourceId || '') ||
+              !fingerprintPattern.test(row.fingerprint || '') || !keyPattern.test(row.itemKey || ''))) {
+            throw new Error('invalid persisted source binding');
+          }
+          await this.translationAnnotationSources({
+            library,
+            keys: [...new Set(rows.map(row => row.itemKey))],
+            sourceIds: rows.map(row => row.sourceId),
+            sourceVersions: Object.fromEntries(rows.map(row => [row.sourceId, row.fingerprint]))
+          });
+        }
+        this.translationVerificationRetries.delete(id);
+      } catch {
+        const view = { ...job, status: 'verification_required', stage: '来源待核验',
+          error: '当前 Zotero 来源已变化或暂时无法重新核验；旧译文暂不作为有效结果返回。' };
+        delete view.result;
+        this.translationVerificationRetries.set(id, { nextAttemptAt: Date.now() + 3000, view });
+        return view;
       }
     }
     return job;

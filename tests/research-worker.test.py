@@ -8,6 +8,8 @@ import re
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
+from types import SimpleNamespace
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,6 +37,7 @@ def payload():
     return {
         'kind': 'fold', 'title': 'Synthetic teacher workforce study', 'library': 'user',
         'itemKey': 'PAPER001', 'attachmentKey': 'PDF00001', 'sha256': 'a' * 64,
+        'researchGuideProfile': {'profileId': 'social-science-general', 'profileVersion': '1'},
         'pages': pages
     }
 
@@ -43,12 +46,28 @@ class ResearchWorkerTests(unittest.TestCase):
     def fake_model(self, worker, *, fail_unit_calls=(), omit_unit_calls=(), omit_units_by_call=None,
                    empty_takeaway_by_call=None, omit_on_retry=False,
                    wrong_retry_id=False, invalid_retry_evidence=False, overview_pages=None):
-        state = {'overview': 0, 'units': 0, 'retries': 0}
+        state = {'overview': 0, 'units': 0, 'retries': 0, 'guide': 0}
         omit_units_by_call = omit_units_by_call or {}
         empty_takeaway_by_call = empty_takeaway_by_call or {}
 
         def ask(prompt, schema, system=''):
             properties = schema.get('properties', {})
+            if 'researchQuestion' in properties:
+                state['guide'] += 1
+                first_quote = 'Teacher supply responds to working conditions.'
+                second_quote = 'Local salary policies shape recruitment decisions.'
+                sections = {}
+                for key in ('researchQuestion','argument','concepts','methods','findings','limitations'):
+                    sections[key] = {
+                        'items': [
+                            {'kind':'author-claim','text':'The authors connect staffing outcomes with local conditions.',
+                             'evidence':[{'page':1,'quote':first_quote}],'basedOn':[]},
+                            {'kind':'researcher-prompt','text':'Compare how district institutions shape these choices.',
+                             'evidence':[],'basedOn':[{'page':2,'quote':second_quote}]},
+                        ],
+                        'gaps':[]
+                    }
+                return {'profileId':'social-science-general','profileVersion':'1',**sections}
             if 'pagesRead' in properties:
                 state['overview'] += 1
                 return {
@@ -99,7 +118,7 @@ class ResearchWorkerTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 result = worker.make_fold(payload())
 
-            self.assertEqual(state, {'overview': 1, 'units': 2, 'retries': 0})
+            self.assertEqual(state, {'overview': 1, 'units': 2, 'retries': 0, 'guide': 1})
             self.assertEqual(result['format'], 'textfold/doc')
             self.assertEqual(result['levels'], ['topic', 'takeaway', 'key', 'brief', 'full'])
             self.assertEqual(result['written'], ['topic', 'takeaway', 'key'])
@@ -108,6 +127,10 @@ class ResearchWorkerTests(unittest.TestCase):
             self.assertEqual(result['provenance']['local'], False)
             self.assertIn('0.10.40', result['provenance']['made_with'])
             self.assertEqual([section['pageIndex'] for section in result['sections']], [0, 1])
+            self.assertEqual(result['researchGuide']['profileId'], 'social-science-general')
+            self.assertEqual(result['researchGuide']['profileVersion'], '1')
+            self.assertEqual(result['researchGuide']['researchQuestion']['items'][0]['kind'], 'author-claim')
+            self.assertEqual(result['researchGuide']['researchQuestion']['items'][1]['kind'], 'researcher-prompt')
             for page, section in zip(payload()['pages'], result['sections']):
                 expected_units = re.split(r'\n\s*\n', page['text'])
                 self.assertEqual(len(section['units']), len(expected_units))
@@ -124,7 +147,7 @@ class ResearchWorkerTests(unittest.TestCase):
             state = self.fake_model(worker, fail_unit_calls={2})
             with contextlib.redirect_stdout(io.StringIO()):
                 result = worker.make_fold(payload())
-            self.assertEqual(state, {'overview': 1, 'units': 3, 'retries': 1})
+            self.assertEqual(state, {'overview': 1, 'units': 3, 'retries': 1, 'guide': 1})
             self.assertEqual(result['coverage']['units'], 3)
             self.assertTrue(all(unit['full'] for section in result['sections'] for unit in section['units']))
 
@@ -134,7 +157,7 @@ class ResearchWorkerTests(unittest.TestCase):
             state = self.fake_model(worker, omit_units_by_call={2: {1}})
             with contextlib.redirect_stdout(io.StringIO()):
                 result = worker.make_fold(payload())
-            self.assertEqual(state, {'overview': 1, 'units': 3, 'retries': 1})
+            self.assertEqual(state, {'overview': 1, 'units': 3, 'retries': 1, 'guide': 1})
             # The third fake call only saw the missing paragraph; the returned U0 fills its original slot.
             repaired = result['sections'][1]['units'][1]
             self.assertEqual(repaired['full'], 'Rural districts face greater hiring constraints.')
@@ -146,7 +169,7 @@ class ResearchWorkerTests(unittest.TestCase):
             state = self.fake_model(worker, empty_takeaway_by_call={2: {1}})
             with contextlib.redirect_stdout(io.StringIO()):
                 result = worker.make_fold(payload())
-            self.assertEqual(state, {'overview': 1, 'units': 3, 'retries': 1})
+            self.assertEqual(state, {'overview': 1, 'units': 3, 'retries': 1, 'guide': 1})
             self.assertIn('Rural districts', result['sections'][1]['units'][1]['takeaway'])
 
     def test_missing_unit_retry_is_bounded_and_still_rejects_incomplete_output(self):
@@ -156,7 +179,7 @@ class ResearchWorkerTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 with self.assertRaisesRegex(RuntimeError, 'TEXTFOLD_INCOMPLETE'):
                     worker.make_fold(payload())
-            self.assertEqual(state, {'overview': 1, 'units': 3, 'retries': 1})
+            self.assertEqual(state, {'overview': 1, 'units': 3, 'retries': 1, 'guide': 0})
 
     def test_missing_unit_retry_rejects_unexpected_ids_and_bad_evidence(self):
         for option in ({'wrong_retry_id': True}, {'invalid_retry_evidence': True}):
@@ -166,7 +189,7 @@ class ResearchWorkerTests(unittest.TestCase):
                 with contextlib.redirect_stdout(io.StringIO()):
                     with self.assertRaisesRegex(RuntimeError, 'TEXTFOLD_INCOMPLETE'):
                         worker.make_fold(payload())
-                self.assertEqual(state, {'overview': 1, 'units': 3, 'retries': 1})
+                self.assertEqual(state, {'overview': 1, 'units': 3, 'retries': 1, 'guide': 0})
 
     def test_overview_must_cover_every_fulltext_page(self):
         with tempfile.TemporaryDirectory(prefix='zotero-textfold-coverage-') as temp:
@@ -175,7 +198,40 @@ class ResearchWorkerTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 with self.assertRaisesRegex(RuntimeError, 'TEXTFOLD_INCOMPLETE'):
                     worker.make_fold(payload())
-            self.assertEqual(state, {'overview': 1, 'units': 0, 'retries': 0})
+            self.assertEqual(state, {'overview': 1, 'units': 0, 'retries': 0, 'guide': 0})
+
+    def test_research_model_is_only_a_child_cli_override_and_is_recorded(self):
+        with tempfile.TemporaryDirectory(prefix='zotero-textfold-model-') as temp:
+            worker = load_worker(temp)
+            captured = []
+
+            def fake_run(args, **kwargs):
+                captured[:] = args
+                output = Path(args[args.index('-o') + 1])
+                output.write_text('{"ok":true}', encoding='utf-8')
+                return SimpleNamespace(returncode=0)
+
+            with patch.dict(os.environ, {
+                'ZOTERO_WORKBENCH_CODEX': 'codex-test',
+                'ZOTERO_WORKBENCH_RESEARCH_MODEL': 'gpt-5.4-codex'
+            }), patch.object(worker.subprocess, 'run', side_effect=fake_run):
+                self.assertEqual(worker.ask('prompt', {'type': 'object', 'properties': {}}), {'ok': True})
+            self.assertEqual(captured[1:5], ['exec', '--model', 'gpt-5.4-codex', '--ephemeral'])
+
+            with patch.dict(os.environ, {
+                'ZOTERO_WORKBENCH_CODEX': 'codex-test',
+                'ZOTERO_WORKBENCH_RESEARCH_MODEL': ''
+            }), patch.object(worker.subprocess, 'run', side_effect=fake_run):
+                worker.ask('prompt', {'type': 'object', 'properties': {}})
+            self.assertNotIn('--model', captured)
+
+            worker.ask = lambda prompt, schema, system='': {
+                'translations': [], 'overview': 'synthetic', 'pagesRead': [1, 2]
+            }
+            self.fake_model(worker)
+            with patch.dict(os.environ, {'ZOTERO_WORKBENCH_RESEARCH_MODEL': 'gpt-5.4-codex'}):
+                result = worker.make_fold(payload())
+            self.assertEqual(result['provenance']['model'], 'gpt-5.4-codex')
 
 
 if __name__ == '__main__':

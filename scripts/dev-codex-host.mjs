@@ -4,6 +4,13 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { StdioClient } from '../tests/mcp-client.mjs';
+import {
+  createResearchTestGate,
+  parseFixtureTheme,
+  parseResearchTestOptions,
+  prepareResearchTestStateDir,
+  RESEARCH_TEST_ITEM,
+} from './dev-codex-host-policy.mjs';
 
 const PANEL_URI = 'ui://zotero/panel.html';
 const DISPLAY_MODES = new Set(['inline', 'fullscreen']);
@@ -27,6 +34,8 @@ const DENIED_TOOL_NAMES = new Set([
 const MAX_RPC_BYTES = 2 * 1024 * 1024;
 const MAX_LOG_ENTRIES = 120;
 const MAX_LOG_TEXT = 1400;
+const researchTestPolicy = parseResearchTestOptions(process.argv.slice(2));
+const fixtureTheme = parseFixtureTheme(process.argv.slice(2));
 
 class RpcError extends Error {
   constructor(code, message) { super(message); this.code = code; }
@@ -57,10 +66,15 @@ function isAllowedResourceUri(uri) {
   ].some(pattern => pattern.test(uri));
 }
 
-function createFixture({ client, toolMap, panelHtml, initialMode = 'fullscreen' }) {
+function createFixture({ client, toolMap, panelHtml, initialMode = 'fullscreen', theme = 'light', researchTestPolicy = null }) {
   const logs = [];
   const appModes = new Set();
-  const state = { mode: DISPLAY_MODES.has(initialMode) ? initialMode : 'fullscreen', initialized: false };
+  const state = {
+    mode: DISPLAY_MODES.has(initialMode) ? initialMode : 'fullscreen',
+    theme: theme === 'dark' ? 'dark' : 'light',
+    initialized: false,
+  };
+  const researchGate = createResearchTestGate(researchTestPolicy);
   const record = (kind, message) => {
     logs.push({ at: new Date().toLocaleTimeString('zh-CN', { hour12: false }), kind, message: boundedText(message) });
     if (logs.length > MAX_LOG_ENTRIES) logs.splice(0, logs.length - MAX_LOG_ENTRIES);
@@ -69,6 +83,16 @@ function createFixture({ client, toolMap, panelHtml, initialMode = 'fullscreen' 
   function assertToolAllowed(name, args = {}) {
     const tool = toolMap.get(name);
     if (!tool) throw new RpcError(-32001, `Fixture 未知工具：${name}`);
+    if (name === 'start_research_job') {
+      try { researchGate.assertStart(args); }
+      catch (error) { throw new RpcError(-32001, error.message); }
+      return { tool, prepare: false, researchAction: 'start' };
+    }
+    if (name === 'cancel_research_job') {
+      try { researchGate.assertCancel(args); }
+      catch (error) { throw new RpcError(-32001, error.message); }
+      return { tool, prepare: false, researchAction: 'cancel' };
+    }
     if (DENIED_TOOL_NAMES.has(name)) throw new RpcError(-32001, `Fixture 安全策略已阻止工具：${name}`);
     const prepare = PREPARE_TOOLS.has(name);
     if (!prepare && !READ_ONLY_TOOLS.has(name)) throw new RpcError(-32001, `Fixture 默认拒绝未列入白名单的工具：${name}`);
@@ -111,7 +135,7 @@ function createFixture({ client, toolMap, panelHtml, initialMode = 'fullscreen' 
             updateModelContext: { text: {} }
           },
           hostContext: {
-            theme: 'light',
+            theme: state.theme,
             displayMode: state.mode,
             availableDisplayModes: [...appModes],
             locale: 'zh-CN',
@@ -131,10 +155,16 @@ function createFixture({ client, toolMap, panelHtml, initialMode = 'fullscreen' 
         if (!state.initialized) throw new RpcError(-32002, '请先完成 ui/initialize 握手。');
         const name = params.name;
         const args = params.arguments && typeof params.arguments === 'object' && !Array.isArray(params.arguments) ? params.arguments : {};
-        const { prepare } = assertToolAllowed(name, args);
-        record(prepare ? 'Prepare 预览' : '工具读取', `${name} · 参数字段：${Object.keys(args).join(', ') || '无'}`);
+        const { prepare, researchAction } = assertToolAllowed(name, args);
+        record(prepare ? 'Prepare 预览' : researchAction ? '显式研究测试' : '工具读取', `${name} · 参数字段：${Object.keys(args).join(', ') || '无'}`);
         const result = await client.call(name, args);
         const structured = result?.structuredContent;
+        if (researchAction === 'start') {
+          const jobId = researchGate.rememberStart(result);
+          if (jobId) record('受限研究任务启动', `${args.kind} · ${researchTestPolicy.itemKey} · ${jobId}`);
+        } else if (researchAction === 'cancel' && result?.isError !== true) {
+          record('受限研究任务取消', `${args.id}`);
+        }
         const summary = structured && typeof structured === 'object'
           ? `返回字段：${Object.keys(structured).slice(0, 12).join(', ')}`
           : `返回内容：${Array.isArray(result?.content) ? result.content.length : 0} 项`;
@@ -180,31 +210,35 @@ function createFixture({ client, toolMap, panelHtml, initialMode = 'fullscreen' 
     }
   }
 
+  const safetyLabel = researchTestPolicy
+    ? `显式研究测试仅开放 ${researchTestPolicy.itemKey} 的 fold/translate/translate_annotations`
+    : 'Zotero 写入与 AI 任务已拦截';
   const wrapperHtml = `<!doctype html>
-<html lang="zh-CN" data-mode="${state.mode}">
+<html lang="zh-CN" data-mode="${state.mode}" data-theme="${state.theme}">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Zotero Workbench · Codex Native Host Fixture</title>
   <style>
-    :root{color-scheme:light;font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#252525;background:#f4f3f0}
+    :root{color-scheme:${state.theme};font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#252525;background:#f4f3f0;--shell-bg:#f4f3f0;--surface:#fff;--border:#dedbd5;--text:#252525;--muted:#68645e;--button-border:#d8d5ce;--button-bg:#fff;--button-text:#34312d;--pressed-border:#7193c2;--pressed-bg:#eef4fc;--pressed-text:#24476e;--log-text:#514c45;--safety:#596f5c}
+    :root[data-theme="dark"]{color-scheme:dark;color:#e8e6e1;background:#1d1e20;--shell-bg:#1d1e20;--surface:#292a2d;--border:#414246;--text:#e8e6e1;--muted:#aaa7a0;--button-border:#55565b;--button-bg:#303135;--button-text:#e2e0db;--pressed-border:#6f8eb8;--pressed-bg:#334357;--pressed-text:#d6e5f8;--log-text:#d0cdc6;--safety:#a7c3a8}
     *{box-sizing:border-box}body{margin:0;min-height:100vh;display:flex;flex-direction:column}
-    header{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:10px 14px;background:#fff;border-bottom:1px solid #dedbd5;flex-wrap:wrap}
-    .title{font-weight:650;white-space:nowrap}.hint{font-size:12px;color:#68645e;margin-left:12px}
-    .controls{display:flex;align-items:center;gap:6px}.controls button{font:inherit;font-size:12px;padding:5px 10px;border:1px solid #d8d5ce;border-radius:6px;background:#fff;color:#34312d;cursor:pointer}
-    .controls button[aria-pressed="true"]{border-color:#7193c2;background:#eef4fc;color:#24476e}
-    .stage{width:100%;height:calc(100vh - 88px);min-height:520px;padding:8px;background:#f4f3f0;transition:width .15s ease}
-    .stage iframe{width:100%;height:100%;display:block;border:1px solid #dedbd5;border-radius:8px;background:#fff}
+    header{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:10px 14px;background:var(--surface);color:var(--text);border-bottom:1px solid var(--border);flex-wrap:wrap}
+    .title{font-weight:650;white-space:nowrap}.hint{font-size:12px;color:var(--muted);margin-left:12px}
+    .controls{display:flex;align-items:center;gap:6px}.controls button{font:inherit;font-size:12px;padding:5px 10px;border:1px solid var(--button-border);border-radius:6px;background:var(--button-bg);color:var(--button-text);cursor:pointer}
+    .controls button[aria-pressed="true"]{border-color:var(--pressed-border);background:var(--pressed-bg);color:var(--pressed-text)}
+    .stage{width:100%;height:calc(100vh - 88px);min-height:520px;padding:8px;background:var(--shell-bg);transition:width .15s ease}
+    .stage iframe{width:100%;height:100%;display:block;border:1px solid var(--border);border-radius:8px;background:var(--surface)}
     html[data-mode="inline"] .stage{width:min(480px,100%);height:calc(100vh - 88px)}
-    details.logs{background:#fff;border-top:1px solid #dedbd5;padding:5px 14px;max-height:170px;overflow:auto;font-size:12px}
-    details.logs summary{cursor:pointer;color:#57534d}#log{margin:6px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;color:#514c45;max-height:125px;overflow:auto}
-    .safety{color:#596f5c}.note{padding-left:8px}
+    details.logs{background:var(--surface);color:var(--text);border-top:1px solid var(--border);padding:5px 14px;max-height:170px;overflow:auto;font-size:12px}
+    details.logs summary{cursor:pointer;color:var(--muted)}#log{margin:6px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--log-text);max-height:125px;overflow:auto}
+    .safety{color:var(--safety)}.note{padding-left:8px}
     @media(max-width:700px){header{align-items:flex-start}.hint{display:block;margin:2px 0 0}.stage{padding:4px}html[data-mode="inline"] .stage{width:100%}}
   </style>
 </head>
 <body>
   <header>
-    <div><span class="title">Codex 原生面板验收</span><span class="hint safety">本机 StdioClient · Zotero 写入与 AI 任务已拦截</span><span class="hint">对话消息和上下文只保存在本页日志</span></div>
+    <div><span class="title">Codex 原生面板验收</span><span class="hint safety">本机 StdioClient · ${safetyLabel} · 所有消息与上下文仅本页捕获</span><span class="hint">这不是正式 Codex 宿主；不会发送真实对话消息</span></div>
     <div class="controls" role="group" aria-label="面板显示模式">
       <button type="button" data-mode-button="inline" aria-pressed="${state.mode === 'inline'}">侧栏</button>
       <button type="button" data-mode-button="fullscreen" aria-pressed="${state.mode === 'fullscreen'}">全屏</button>
@@ -217,13 +251,13 @@ function createFixture({ client, toolMap, panelHtml, initialMode = 'fullscreen' 
     (()=>{
       const frame=document.getElementById('app'), log=document.getElementById('log');
       const buttons=[...document.querySelectorAll('[data-mode-button]')];
-      const origin=location.origin; let mode=document.documentElement.dataset.mode;
+      const origin=location.origin; let mode=document.documentElement.dataset.mode; const theme=document.documentElement.dataset.theme;
       const post=(message)=>frame.contentWindow?.postMessage(message,origin);
       function setMode(next,notify=true){
         if(!['inline','fullscreen'].includes(next))return false;
         mode=next;document.documentElement.dataset.mode=next;
         buttons.forEach(button=>button.setAttribute('aria-pressed',String(button.dataset.modeButton===next)));
-        if(notify)post({jsonrpc:'2.0',method:'ui/notifications/host-context-changed',params:{displayMode:next}});
+        if(notify)post({jsonrpc:'2.0',method:'ui/notifications/host-context-changed',params:{displayMode:next,theme}});
         return true;
       }
       buttons.forEach(button=>button.addEventListener('click',()=>setMode(button.dataset.modeButton)));
@@ -235,7 +269,7 @@ function createFixture({ client, toolMap, panelHtml, initialMode = 'fullscreen' 
           const requested=message.params?.mode;
           if(['inline','fullscreen'].includes(requested))setMode(requested,false);
           if(Object.hasOwn(message,'id'))post({jsonrpc:'2.0',id:message.id,result:{mode}});
-          post({jsonrpc:'2.0',method:'ui/notifications/host-context-changed',params:{displayMode:mode}});
+          post({jsonrpc:'2.0',method:'ui/notifications/host-context-changed',params:{displayMode:mode,theme}});
           return;
         }
         try{
@@ -339,7 +373,9 @@ function createFixture({ client, toolMap, panelHtml, initialMode = 'fullscreen' 
 }
 
 async function createClientAndFixture() {
-  const client = new StdioClient({});
+  await prepareResearchTestStateDir(researchTestPolicy);
+  const clientEnv = researchTestPolicy ? { ZOTERO_WORKBENCH_STATE_DIR: researchTestPolicy.stateDir } : {};
+  const client = new StdioClient(clientEnv);
   try {
     await client.ready();
     const listed = await client.request('tools/list', {});
@@ -348,7 +384,7 @@ async function createClientAndFixture() {
     if (typeof panelHtml !== 'string' || !panelHtml.includes('ui/initialize'))
       throw new Error(`MCP server did not return the native panel resource ${PANEL_URI}.`);
     const toolMap = new Map((listed.tools ?? []).map(tool => [tool.name, tool]));
-    return { client, fixture: createFixture({ client, toolMap, panelHtml }), toolMap, panelHtml };
+    return { client, fixture: createFixture({ client, toolMap, panelHtml, theme: fixtureTheme, researchTestPolicy }), toolMap, panelHtml };
   } catch (error) {
     client.close();
     throw error;
@@ -372,10 +408,29 @@ async function selfTest() {
     });
     assert.equal(init.protocolVersion, '2025-11-25');
     assert.equal(init.hostContext.displayMode, 'fullscreen');
+    assert.equal(init.hostContext.theme, fixtureTheme);
     assert.deepEqual(init.hostContext.availableDisplayModes, ['inline', 'fullscreen']);
     assert.equal(fixture.dispatch && fixture.mode, 'fullscreen');
-    assert.throws(() => fixture.assertToolAllowed('start_research_job', {}), /安全策略|白名单/);
+    if (researchTestPolicy)
+      assert.throws(() => fixture.assertToolAllowed('start_research_job', {}), /只允许/);
+    else
+      assert.throws(() => fixture.assertToolAllowed('start_research_job', {}), /安全策略|白名单|默认阻止/);
     assert.throws(() => fixture.assertToolAllowed('trash_reader_annotation', {}), /安全策略/);
+    assert.throws(() => fixture.assertToolAllowed('cancel_research_job', { id: 'a'.repeat(24) }), /只允许取消|安全策略/);
+    if (toolMap.has('open_in_zotero'))
+      assert.throws(() => fixture.assertToolAllowed('open_in_zotero', { url: `zotero://select/library/items/${RESEARCH_TEST_ITEM}` }), /安全策略|白名单/);
+    if (researchTestPolicy) {
+      for (const kind of ['fold', 'translate'])
+        assert.equal(fixture.assertToolAllowed('start_research_job', { kind, library: 'user', key: researchTestPolicy.itemKey }).researchAction, 'start');
+      const sourceId = 'a'.repeat(16);
+      assert.equal(fixture.assertToolAllowed('start_research_job', {
+        kind: 'translate_annotations', library: 'user', keys: [researchTestPolicy.itemKey],
+        sourceIds: [sourceId], sourceVersions: { [sourceId]: 'b'.repeat(64) },
+      }).researchAction, 'start');
+      assert.throws(() => fixture.assertToolAllowed('start_research_job', { kind: 'draft', library: 'user', key: researchTestPolicy.itemKey }), /只允许 fold|translate/);
+      assert.throws(() => fixture.assertToolAllowed('start_research_job', { kind: 'fold', library: 'user', key: 'OTHER001' }), /只允许/);
+      assert.throws(() => fixture.assertToolAllowed('start_research_job', { kind: 'translate_annotations', library: 'user', keys: [researchTestPolicy.itemKey, 'OTHER001'], sourceIds: [sourceId], sourceVersions: { [sourceId]: 'b'.repeat(64) } }), /只允许/);
+    }
     assert.equal(fixture.assertToolAllowed('prepare_library_action', {}).prepare, true);
     assertToolPreparePolicy(toolMap);
     await fixture.dispatch({ jsonrpc: '2.0', id: 2, method: 'ui/message', params: { role: 'user', content: [{ type: 'text', text: 'fixture-only sample' }] } });
@@ -389,7 +444,10 @@ async function selfTest() {
     const rootResponse = await fetch(url);
     assert.equal(rootResponse.status, 200);
     const wrapper = await rootResponse.text();
-    assert.match(wrapper, /本页日志/);
+    assert.match(wrapper, /本地宿主日志 · 仅本页可见，不连接 Codex 对话/);
+    assert.match(wrapper, new RegExp(`data-theme="${fixtureTheme}"`));
+    assert.match(wrapper, /params:\{displayMode:next,theme\}/);
+    assert.match(wrapper, /params:\{displayMode:mode,theme\}/);
     assert.match(wrapper, /src="about:blank"/);
     assert.ok(wrapper.indexOf("window.addEventListener('message'") < wrapper.indexOf("frame.src='/panel'"), 'host listener must be installed before the panel is loaded');
     const panelResponse = await fetch(`${url}/panel`);
@@ -428,6 +486,8 @@ function assertToolPreparePolicy(toolMap) {
 const portArgIndex = process.argv.indexOf('--port');
 const requestedPort = portArgIndex >= 0 ? Number(process.argv[portArgIndex + 1]) : Number(process.env.ZOTERO_DEV_HOST_PORT ?? 4173);
 if (process.argv.includes('--self-test')) {
+  if (researchTestPolicy)
+    throw new Error('--self-test 始终验证默认 AI 全封锁，请移除研究测试 opt-in 参数后重试。');
   await selfTest();
 } else {
   if (!Number.isInteger(requestedPort) || requestedPort < 0 || requestedPort > 65535)
@@ -436,7 +496,9 @@ if (process.argv.includes('--self-test')) {
   try {
     const address = await fixture.listen(requestedPort);
     console.log(`Codex native panel fixture ready at http://127.0.0.1:${address.port}`);
-    console.log('本机验收专用：只读工具 + prepare 预览；Zotero 写入、AI 任务和外部对话发送均被阻止。');
+    console.log(researchTestPolicy
+      ? `本机验收专用（非正式 Codex 宿主）：仅显式启用 ${researchTestPolicy.itemKey} 的 fold/translate/translate_annotations；Zotero 写入、draft、其他文献任务和外部对话发送均被阻止。`
+      : '本机验收专用：只读工具 + prepare 预览；Zotero 写入、AI 任务和外部对话发送均被阻止。');
     console.log('Use Ctrl+C to stop.');
     const shutdown = async () => {
       await fixture.close();

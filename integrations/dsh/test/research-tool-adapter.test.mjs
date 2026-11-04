@@ -51,6 +51,17 @@ test('research jobs retain the research POST envelope and unsupported tools rema
   const api = {
     async requestJson(path, options) { calls.push([path, options]); return { id: 'job-1' }; },
   };
+  const translateArgs = { kind: 'translate', library: 'user', key: 'TEST0001' };
+  await callResearchToolWithApi(api, 'start_research_job', translateArgs);
+  assert.deepEqual(calls, [['/research', { method: 'POST', body: { action: 'start', args: translateArgs } }]]);
+  calls.length = 0;
+  const annotationArgs = {
+    kind: 'translate_annotations', library: 'user', keys: ['TEST0001'],
+    sourceIds: ['a'.repeat(16)], sourceVersions: { ['a'.repeat(16)]: 'b'.repeat(64) },
+  };
+  await callResearchToolWithApi(api, 'start_research_job', annotationArgs);
+  assert.deepEqual(calls, [['/research', { method: 'POST', body: { action: 'start', args: annotationArgs } }]]);
+  calls.length = 0;
   const result = await callResearchToolWithApi(api, 'research_job', { id: 'job-1' });
   assert.deepEqual(result, { id: 'job-1' });
   assert.deepEqual(calls, [['/research', { method: 'POST', body: { action: 'status', id: 'job-1' } }]]);
