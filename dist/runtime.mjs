@@ -36310,7 +36310,7 @@ var EMPTY_COMPLETION_RESULT = {
 };
 
 // src/contract.ts
-var PLUGIN_VERSION = "1.2.1";
+var PLUGIN_VERSION = "1.2.2";
 var SERVER_NAME = "zotero-workbench";
 var SURFACE_ID = "zotero";
 var PANEL_URI = "ui://zotero/panel.html";

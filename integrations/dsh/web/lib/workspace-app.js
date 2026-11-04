@@ -30,6 +30,12 @@ import { mountResearchWorkbench } from './research-view.js';
 import { mountCollaborationWorkbench } from './collaboration-view.js';
 import { collaborationRequestEnvelope } from './collaboration-api.js';
 import {
+  canTranslateMetadataItemType,
+  metadataNeedsTranslation,
+  metadataTranslationSignature,
+  requestMetadataTranslation,
+} from './metadata-translation.js';
+import {
   doiHref,
   normalizeCollections,
   normalizeDetail,
@@ -102,6 +108,7 @@ const state = {
   detail: null,
   detailStatus: 'idle', // idle | loading | ready | error
   detailError: '',
+  metadataTranslations: new Map(),
 
   reader: {
     open: false,
@@ -1038,6 +1045,11 @@ function renderList() {
 function renderItemRow(item) {
   const selected = state.currentKey === item.key;
   const checked = state.selection.has(item.key);
+  const canTranslateMetadata = canTranslateMetadataItemType(item.itemType);
+  const metadataTranslation = canTranslateMetadata ? metadataTranslationForListItem(item) : null;
+  const metadataCompleted = metadataTranslation?.status === 'completed' && metadataTranslation.result;
+  const metadataNoop = metadataTranslation?.status === 'skipped' || (metadataCompleted
+    && !metadataCompleted.title.translated && !metadataCompleted.abstract.translated);
   const authors = item.authors.length ? item.authors.slice(0, 3).join('、') : '未知作者';
   const metaBits = [];
   metaBits.push(`<span class="item-type-chip">${escapeHtml(itemTypeLabel(item.itemType))}</span>`);
@@ -1060,8 +1072,122 @@ function renderItemRow(item) {
         <span class="ws-item-meta">${metaBits.join('<span class="dot"></span>')}</span>
         ${chips.length ? `<span class="ws-item-chips">${chips.join('')}</span>` : ''}
       </button>
+      ${canTranslateMetadata ? `<button class="btn btn-quiet ws-item-translate" type="button" data-ws-action="translate-metadata" data-ws-key="${escapeHtml(item.key)}" ${['starting', 'running', 'completed', 'skipped'].includes(metadataTranslation?.status) ? 'disabled' : ''}>${metadataNoop ? '无需翻译' : metadataCompleted ? '已翻译' : ['starting', 'running'].includes(metadataTranslation?.status) ? '翻译中…' : metadataTranslation?.status === 'failed' ? '重试翻译' : '翻译标题与摘要'}</button>` : ''}
+      ${canTranslateMetadata ? renderMetadataListTranslation(metadataTranslation) : ''}
       ${renderDuplicateReview(item)}
     </li>`;
+}
+
+function metadataTranslationForListItem(item) {
+  if (!canTranslateMetadataItemType(item?.itemType)) return null;
+  const entry = state.metadataTranslations.get(item.key);
+  if (!entry || metadataTranslationSignature({ title: entry.title }) !== metadataTranslationSignature({ title: item.title })) return null;
+  return entry;
+}
+
+function renderMetadataListTranslation(entry) {
+  if (!entry) return '';
+  if (entry.status === 'completed' && entry.result) {
+    const title = entry.result.title.translated
+      ? `<p><strong>标题译文：</strong>${escapeHtml(entry.result.title.translation)}</p>` : '';
+    const abstract = entry.result.abstract.translated
+      ? `<details><summary>摘要译文</summary><p>${escapeHtml(entry.result.abstract.translation)}</p></details>` : '';
+    return title || abstract
+      ? `<div class="ws-item-translation">${title}${abstract}</div>`
+      : '<div class="ws-item-translation is-muted">标题与摘要无需翻译。</div>';
+  }
+  if (entry.status === 'failed')
+    return `<div class="ws-item-translation is-error">翻译失败：${escapeHtml(entry.error || '可重试。')}</div>`;
+  if (entry.status === 'skipped')
+    return '<div class="ws-item-translation is-muted">中文元数据无需翻译。</div>';
+  if (entry.status === 'starting' || entry.status === 'running')
+    return `<div class="ws-item-translation is-muted">${escapeHtml(entry.stage || '正在翻译标题与摘要…')}</div>`;
+  return '';
+}
+
+function renderMetadataDetailStatus(detail, entry) {
+  if (!canTranslateMetadataItemType(detail?.itemType)) return '';
+  if (!metadataNeedsTranslation(detail)) return '';
+  if (entry?.status === 'completed') {
+    const translated = entry.result.title.translated || entry.result.abstract.translated;
+    return `<p class="ws-metadata-translation-status is-muted">${translated ? '标题和摘要译文已核对。' : '标题与摘要无需翻译。'}</p>`;
+  }
+  if (entry?.status === 'failed') {
+    return `<div class="ws-metadata-translation-status is-error"><span>元数据翻译失败：${escapeHtml(entry.error || '可重试。')}</span><button class="btn btn-quiet" type="button" data-ws-action="translate-metadata" data-ws-key="${escapeHtml(detail.key)}">重试</button></div>`;
+  }
+  const status = entry?.stage || (entry?.status === 'running' ? '正在翻译标题与摘要…' : '正在准备标题与摘要的中文对照…');
+  return `<p class="ws-metadata-translation-status is-muted" aria-live="polite">${escapeHtml(status)}</p>`;
+}
+
+function refreshMetadataTranslationViews(key) {
+  if (state.currentKey === key && state.detail?.key === key) renderDetail();
+  renderList();
+}
+
+function metadataTranslationEntry(detail) {
+  if (!canTranslateMetadataItemType(detail?.itemType)) return null;
+  const entry = detail?.key ? state.metadataTranslations.get(detail.key) : null;
+  return entry && entry.signature === metadataTranslationSignature(detail) ? entry : null;
+}
+
+async function translateMetadataForDetail(detail, { automatic = false } = {}) {
+  if (!detail?.key || !canTranslateMetadataItemType(detail.itemType)) return;
+  const signature = metadataTranslationSignature(detail);
+  if (!metadataNeedsTranslation(detail)) {
+    if (automatic) return;
+    state.metadataTranslations.set(detail.key, {
+      signature, title: detail.title, status: 'skipped', result: null, error: '',
+    });
+    refreshMetadataTranslationViews(detail.key);
+    return;
+  }
+  if (!String(detail.title || '').trim() && !String(detail.abstractNote || '').trim()) return;
+  const prior = state.metadataTranslations.get(detail.key);
+  if (prior?.signature === signature) {
+    if (prior.status === 'completed' || prior.status === 'running' || prior.status === 'starting') return;
+  }
+  const entry = { signature, title: detail.title, status: 'starting', result: null, error: '', stage: '准备翻译标题与摘要…' };
+  state.metadataTranslations.set(detail.key, entry);
+  refreshMetadataTranslationViews(detail.key);
+  try {
+    const result = await requestMetadataTranslation(callResearchTool, detail, {
+      library: 'user', key: detail.key,
+      onStatus(snapshot) {
+        if (state.metadataTranslations.get(detail.key) !== entry) return;
+        entry.status = ['starting', 'running'].includes(snapshot?.status) ? snapshot.status : entry.status;
+        entry.stage = snapshot?.stage || (snapshot?.status === 'running' ? '正在翻译标题与摘要…' : entry.stage);
+        refreshMetadataTranslationViews(detail.key);
+      },
+    });
+    if (state.metadataTranslations.get(detail.key) === entry) {
+      entry.result = result;
+      entry.status = 'completed';
+      entry.stage = '';
+    }
+  } catch (error) {
+    if (state.metadataTranslations.get(detail.key) === entry) {
+      entry.status = 'failed';
+      entry.error = error?.message || String(error);
+      entry.stage = '';
+    }
+  }
+  if (state.metadataTranslations.get(detail.key) === entry) refreshMetadataTranslationViews(detail.key);
+}
+
+async function translateMetadataFromList(key) {
+  try {
+    const detail = state.detail?.key === key && state.detailStatus === 'ready'
+      ? state.detail
+      : normalizeDetail(await api.item({ library: 'user', key }), state.collections);
+    await translateMetadataForDetail(detail);
+  } catch (error) {
+    const item = state.items.find(candidate => candidate.key === key);
+    state.metadataTranslations.set(key, {
+      signature: '', title: item?.title || '', status: 'failed', result: null,
+      error: error?.message || '无法读取文献标题和摘要。',
+    });
+    refreshMetadataTranslationViews(key);
+  }
 }
 
 function updateResultCount() {
@@ -1291,6 +1417,7 @@ async function loadDetail(key, { silent = false } = {}) {
     state.detailStatus = 'ready';
     state.reader.attachmentKey = (detail.attachments.find((attachment) => attachment.isPdf) || {}).key || '';
     renderDetail();
+    if (state.currentKey === key) void translateMetadataForDetail(detail, { automatic: true });
     renderReaderToolbar();
     if (state.center === 'reader' && !state.reader.open) renderReaderStage();
   } catch (error) {
@@ -1341,6 +1468,11 @@ function renderDetail() {
   }
   const detail = state.detail;
   if (!detail) return;
+  const metadataTranslation = metadataTranslationEntry(detail);
+  const translatedTitle = metadataTranslation?.status === 'completed' && metadataTranslation.result.title.translated
+    ? `<p class="ws-metadata-translation-title"><strong>中文标题：</strong>${escapeHtml(metadataTranslation.result.title.translation)}</p>` : '';
+  const translatedAbstract = metadataTranslation?.status === 'completed' && metadataTranslation.result.abstract.translated
+    ? `<h3 class="ws-detail-h3 ws-metadata-translation-label">摘要 · 中文译文</h3><p class="ws-detail-abstract ws-metadata-translation-abstract">${escapeHtml(metadataTranslation.result.abstract.translation)}</p>` : '';
   const doi = doiHref(detail.DOI);
   const pdfAttachments = detail.attachments.filter((attachment) => attachment.isPdf);
   const venue = venueLine(detail);
@@ -1410,6 +1542,7 @@ function renderDetail() {
   el.detailScroll.innerHTML = `
     <div class="ws-detail-body">
       <h2 class="ws-detail-title" title="${escapeHtml(detail.title)}">${escapeHtml(detail.title)}</h2>
+      ${translatedTitle}
       <div class="ws-detail-sub">${escapeHtml(authorLine)}${detail.year ? ` · ${escapeHtml(detail.year)}` : ''}</div>
       <div class="ws-detail-actions">
         <button class="btn btn-primary" type="button" data-ws-action="read-pdf" ${pdfAttachments.length ? '' : 'disabled title="该条目没有 PDF 附件"'}>${icon('doc', 13)}<span>阅读 PDF</span></button>
@@ -1439,8 +1572,10 @@ function renderDetail() {
         ${additionalFieldsHtml}
       </div>
       <div class="ws-detail-section" id="ws-detail-abstract">
-        <h3 class="ws-detail-h3">摘要</h3>
+        <h3 class="ws-detail-h3">摘要 · 原文</h3>
         <p class="ws-detail-abstract ${detail.abstractNote ? '' : 'is-empty'}">${detail.abstractNote ? escapeHtml(detail.abstractNote) : '（该条目没有摘要）'}</p>
+        ${translatedAbstract}
+        ${renderMetadataDetailStatus(detail, metadataTranslation)}
       </div>
       <div class="ws-detail-section" id="ws-detail-attachments">
         <h3 class="ws-detail-h3">附件 <span class="count-badge">${detail.attachments.length}</span></h3>
@@ -2890,6 +3025,15 @@ function bindEvents() {
           syncSelectionDom();
         }
         setView('citations');
+        break;
+      }
+      case 'translate-metadata': {
+        event.preventDefault();
+        const key = action.dataset.wsKey || '';
+        if (!key) break;
+        if (state.detail?.key === key && state.detailStatus === 'ready')
+          void translateMetadataForDetail(state.detail);
+        else void translateMetadataFromList(key);
         break;
       }
       case 'retry-detail':

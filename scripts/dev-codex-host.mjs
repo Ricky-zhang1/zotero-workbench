@@ -235,7 +235,7 @@ function createFixture({ client, toolMap, panelHtml, initialMode = 'fullscreen',
   const safetyLabel = annotationTestPolicy
     ? '显式批注备注验收仅开放指定个人批注的备注读写；其他写入与 AI 任务已拦截'
     : researchTestPolicy
-      ? `显式研究测试仅开放 ${researchTestPolicy.itemKey} 的 fold/translate/translate_annotations`
+      ? `显式研究测试仅开放 ${researchTestPolicy.itemKey} 的 fold/translate/translate_metadata/translate_annotations`
       : 'Zotero 写入与 AI 任务已拦截';
   const wrapperHtml = `<!doctype html>
 <html lang="zh-CN" data-mode="${state.mode}" data-theme="${state.theme}">
@@ -450,7 +450,7 @@ async function selfTest() {
         assert.throws(() => fixture.assertToolAllowed(name, {}), /默认阻止|严格符合 fixture 身份|未知工具/);
     }
     if (researchTestPolicy) {
-      for (const kind of ['fold', 'translate'])
+      for (const kind of ['fold', 'translate', 'translate_metadata'])
         assert.equal(fixture.assertToolAllowed('start_research_job', { kind, library: 'user', key: researchTestPolicy.itemKey }).researchAction, 'start');
       const sourceId = 'a'.repeat(16);
       assert.equal(fixture.assertToolAllowed('start_research_job', {
@@ -458,6 +458,8 @@ async function selfTest() {
         sourceIds: [sourceId], sourceVersions: { [sourceId]: 'b'.repeat(64) },
       }).researchAction, 'start');
       assert.throws(() => fixture.assertToolAllowed('start_research_job', { kind: 'draft', library: 'user', key: researchTestPolicy.itemKey }), /只允许 fold|translate/);
+      assert.throws(() => fixture.assertToolAllowed('start_research_job', { kind: 'translate_metadata', library: 'user', key: 'OTHER001' }), /只允许/);
+      assert.throws(() => fixture.assertToolAllowed('start_research_job', { kind: 'translate_metadata', library: 'user', key: researchTestPolicy.itemKey, extra: true }), /只允许/);
       assert.throws(() => fixture.assertToolAllowed('start_research_job', { kind: 'fold', library: 'user', key: 'OTHER001' }), /只允许/);
       assert.throws(() => fixture.assertToolAllowed('start_research_job', { kind: 'translate_annotations', library: 'user', keys: [researchTestPolicy.itemKey, 'OTHER001'], sourceIds: [sourceId], sourceVersions: { [sourceId]: 'b'.repeat(64) } }), /只允许/);
     }
@@ -529,7 +531,7 @@ if (process.argv.includes('--self-test')) {
     console.log(annotationTestPolicy
       ? `本机验收专用（非正式 Codex 宿主）：仅允许显式身份 ${annotationTestPolicy.annotationKey}/${annotationTestPolicy.attachmentKey} 的批注备注读取与受保护更新；其他 Zotero 写入、AI 任务和外部对话发送均被阻止。`
       : researchTestPolicy
-        ? `本机验收专用（非正式 Codex 宿主）：仅显式启用 ${researchTestPolicy.itemKey} 的 fold/translate/translate_annotations；Zotero 写入、draft、其他文献任务和外部对话发送均被阻止。`
+        ? `本机验收专用（非正式 Codex 宿主）：仅显式启用 ${researchTestPolicy.itemKey} 的 fold/translate/translate_metadata/translate_annotations；Zotero 写入、draft、其他文献任务和外部对话发送均被阻止。`
         : '本机验收专用：只读工具 + prepare 预览；Zotero 写入、AI 任务和外部对话发送均被阻止。');
     console.log('Use Ctrl+C to stop.');
     const shutdown = async () => {

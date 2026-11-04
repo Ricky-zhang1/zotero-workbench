@@ -8,12 +8,15 @@ import { fileURLToPath } from 'node:url';
 import { libraryPrefix, ZoteroSession } from '../../dist/runtime.mjs';
 import {
   buildTranslationBlocks, MAX_ANNOTATION_TRANSLATION_BATCH, MAX_ANNOTATION_TRANSLATION_CHARS,
+  MAX_TRANSLATION_BLOCK_CHARS,
   runTranslationWorker, TranslationWorkerError, TRANSLATION_TARGET_LANGUAGE, TRANSLATION_VERSION,
   translationCacheKey, validateTranslationOutput
 } from './translation-worker.mjs';
 import { configuredResearchModel, ResearchModelConfigError } from './research-model-config.mjs';
 import { scopeKeys } from './evidence.mjs';
 import { annotationLink } from './library.mjs';
+import { zoteroPlainText } from './plain-text.mjs';
+import { metadataRequiresTranslation } from './metadata-translation-heuristic.mjs';
 import { installPagination } from '../transports/zotero-local.mjs';
 
 const root = resolve(fileURLToPath(new URL('../..', import.meta.url)));
@@ -108,7 +111,7 @@ function translationModelProvenance(rows) {
   for (const row of rows) {
     if (typeof row.model !== 'string' || !researchModelPattern.test(row.model)) continue;
     if (!groups.has(row.model)) groups.set(row.model, []);
-    groups.get(row.model).push(row.id ?? row.blockId ?? row.sourceId);
+    groups.get(row.model).push(row.field ?? row.id ?? row.blockId ?? row.sourceId);
   }
   if (groups.size === 1) return { model: groups.keys().next().value };
   if (groups.size > 1) return { models: [...groups].map(([model, ids]) => ({ model, ids })) };
@@ -129,6 +132,22 @@ export function noteText(html) {
       amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' '
     })[name])
     .replace(/\n{3,}/g, '\n\n').trim();
+}
+
+function normalizeMetadataValue(value) {
+  return (typeof value === 'string' ? value : '').replace(/\r\n?/g, '\n').normalize('NFC');
+}
+
+function metadataFingerprint({ library, itemKey, title, abstractNote, language }) {
+  return hash({
+    library,
+    itemKey,
+    title: normalizeMetadataValue(title),
+    abstractNote: normalizeMetadataValue(abstractNote),
+    language: normalizeMetadataValue(language).trim().toLowerCase(),
+    targetLanguage: TRANSLATION_TARGET_LANGUAGE,
+    translationVersion: TRANSLATION_VERSION,
+  });
 }
 
 export function materialRecord({ library, itemKey, title, raw, attachmentKey }) {
@@ -697,10 +716,70 @@ export class ResearchWorkspace {
     };
   }
 
+  async metadataSource(library, key) {
+    validLibrary(library);
+    validItemKey(key);
+    let version;
+    let data;
+    try {
+      await this.session.library.checkVersion(library);
+      version = String(this.session.library.versionOf(library));
+      const { data: raw } = await this.session.client.getJson(`${libraryPrefix(library)}/items/${key}`);
+      if (!isRecord(raw) || !isRecord(raw.data) || raw.key !== key ||
+          (typeof raw.data.key === 'string' && raw.data.key !== key) ||
+          ['attachment', 'annotation', 'note'].includes(raw.data.itemType) ||
+          [raw.deleted, raw.data.deleted].some(deleted => deleted !== undefined && ![false, 0, '0'].includes(deleted)))
+        throw failure('无法确认所选 Zotero 文献的标题和摘要；请刷新后重试。');
+      data = raw.data;
+      await this.session.library.checkVersion(library);
+      if (String(this.session.library.versionOf(library)) !== version)
+        throw failure('Zotero 文库在读取期间发生变化；请刷新后重试。');
+    } catch (error) {
+      if (error instanceof ResearchWorkspaceError) throw error;
+      throw failure('无法从 Zotero 读取标题和摘要；请检查连接后重试。');
+    }
+
+    const titleSource = normalizeMetadataValue(data.title);
+    const abstractSource = normalizeMetadataValue(data.abstractNote);
+    const language = normalizeMetadataValue(data.language).trim().toLowerCase();
+    return {
+      library,
+      itemKey: key,
+      titleSource,
+      abstractSource,
+      language,
+      title: zoteroPlainText(titleSource),
+      abstract: zoteroPlainText(abstractSource),
+      sourceFingerprint: metadataFingerprint({ library, itemKey: key, title: titleSource,
+        abstractNote: abstractSource, language }),
+    };
+  }
+
+  metadataTranslationBlocks(source) {
+    const namedFields = [
+      { field: 'title', text: source.title },
+      { field: 'abstract', text: source.abstract },
+    ].filter(field => field.text.length > 0);
+    if (!namedFields.length) return [];
+    if (namedFields.reduce((total, field) => total + field.text.length, 0) > 160000)
+      throw failure('标题和摘要合计超过 16 万字符上限；未截断翻译。');
+    const pages = namedFields.map((field, index) => ({ page: index + 1, text: field.text }));
+    return buildTranslationBlocks(pages).map(block => {
+      const field = namedFields[block.pageIndex].field;
+      return {
+        id: hash(JSON.stringify([field, block.id, block.original])).slice(0, 16),
+        field,
+        originalFingerprint: hash(block.original),
+        original: block.original,
+        preserveOriginal: !metadataRequiresTranslation(block.original),
+      };
+    });
+  }
+
   validateStartArgs(rawArgs) {
     const args = requireRecord(rawArgs);
     onlyKeys(args, new Set(['kind', 'library', 'key', 'keys', 'sourceIds', 'sourceVersions', 'purpose', 'framework']));
-    if (!['fold', 'draft', 'translate', 'translate_annotations'].includes(args.kind)) throw new Error('无效任务。');
+    if (!['fold', 'draft', 'translate', 'translate_annotations', 'translate_metadata'].includes(args.kind)) throw new Error('无效任务。');
     if (args.kind === 'fold') {
       const library = validLibrary(args.library ?? 'user');
       const key = validItemKey(args.key);
@@ -714,6 +793,10 @@ export class ResearchWorkspace {
     if (args.kind === 'translate') {
       onlyKeys(args, new Set(['kind', 'library', 'key']));
       return { kind: 'translate', library: validLibrary(args.library ?? 'user'), key: validItemKey(args.key) };
+    }
+    if (args.kind === 'translate_metadata') {
+      onlyKeys(args, new Set(['kind', 'library', 'key']));
+      return { kind: 'translate_metadata', library: validLibrary(args.library ?? 'user'), key: validItemKey(args.key) };
     }
     if (args.kind === 'translate_annotations') {
       onlyKeys(args, new Set(['kind', 'library', 'keys', 'sourceIds', 'sourceVersions']));
@@ -770,6 +853,8 @@ export class ResearchWorkspace {
         await this.runFulltextTranslation(job, args, scratch);
       } else if (args.kind === 'translate_annotations') {
         await this.runAnnotationTranslation(job, args, scratch);
+      } else if (args.kind === 'translate_metadata') {
+        await this.runMetadataTranslation(job, args, scratch);
       } else {
         let payload;
         if (args.kind === 'fold') payload = {
@@ -843,7 +928,8 @@ export class ResearchWorkspace {
   }
 
   async executeTranslations(job, payload, scratch, progress, model) {
-    const items = payload?.kind === 'translate' ? payload.blocks : payload?.sources;
+    const items = payload?.kind === 'translate' ? payload.blocks
+      : payload?.kind === 'translate_annotations' ? payload.sources : payload?.fields;
     if (!items?.length) return [];
     let response;
     if (this.runner) {
@@ -983,6 +1069,86 @@ export class ResearchWorkspace {
     };
   }
 
+  async runMetadataTranslation(job, args, scratch) {
+    const source = await this.metadataSource(args.library, args.key);
+    const blocks = this.metadataTranslationBlocks(source);
+    const translations = new Map();
+    const missing = [];
+    for (const block of blocks) {
+      if (block.preserveOriginal) {
+        translations.set(block.id, { id: block.id, translation: block.original, unchanged: true, field: block.field });
+        continue;
+      }
+      const cached = await this.readTranslationCache(block.originalFingerprint);
+      if (cached) translations.set(block.id, {
+        id: block.id, translation: cached.translation, unchanged: false,
+        ...(cached.model ? { model: cached.model } : {}), field: block.field,
+      });
+      else missing.push(block);
+    }
+
+    if (job.status !== 'running') return;
+    let model = null;
+    if (missing.length) model = await configuredResearchModel({ stateRoot: dirname(this.dir) });
+    const modelPayload = {
+      kind: 'translate_metadata',
+      fields: missing.map(({ id, original, preserveOriginal }) => ({ id, original, preserveOriginal })),
+    };
+    await this.progress(job, { stage: '读取标题和摘要', progress: 2 });
+    if (job.status !== 'running') return;
+    await mkdir(scratch, { recursive: false, mode: 0o700 });
+    const translated = await this.executeTranslations(job, modelPayload, scratch,
+      update => this.progress(job, update), model);
+    const missingById = new Map(missing.map(block => [block.id, block]));
+    for (const row of translated) {
+      const block = missingById.get(row.id);
+      if (!block) throw failure('标题或摘要翻译包含范围外条目；未保存任务结果。');
+      translations.set(row.id, { ...row, field: block.field, ...(model ? { model } : {}) });
+    }
+    if (job.status !== 'running') return;
+
+    const current = await this.metadataSource(args.library, args.key);
+    if (current.sourceFingerprint !== source.sourceFingerprint)
+      throw failure('标题或摘要在翻译期间发生变化；未保存旧译文，请重新翻译。');
+
+    const fieldResult = field => {
+      const fieldBlocks = blocks.filter(block => block.field === field);
+      if (!fieldBlocks.length) return { original: '', translation: '', translated: false, available: false };
+      const rows = fieldBlocks.map(block => translations.get(block.id));
+      if (rows.some(row => !row)) throw failure('标题或摘要翻译覆盖不完整；未保存任务结果。');
+      return {
+        original: fieldBlocks.map(block => block.original).join(''),
+        translation: rows.map(row => row.translation).join(''),
+        translated: rows.some(row => row.unchanged !== true),
+        available: true,
+      };
+    };
+    const title = fieldResult('title');
+    const abstract = fieldResult('abstract');
+    if (translations.size !== blocks.length || title.original !== source.title || abstract.original !== source.abstract)
+      throw failure('标题或摘要分块未完整覆盖；未保存任务结果。');
+
+    const translatedCache = translated.filter(row => row.unchanged !== true).map(row => {
+      const block = missing.find(item => item.id === row.id);
+      if (!block) throw failure('标题或摘要翻译来源丢失；未保存任务结果。');
+      return { originalFingerprint: block.originalFingerprint, translation: row.translation, model };
+    });
+    await this.saveTranslationCache(translatedCache);
+    job.result = {
+      format: 'zotero-workbench/metadata-translation', version: 1,
+      targetLanguage: TRANSLATION_TARGET_LANGUAGE,
+      library: source.library,
+      itemKey: source.itemKey,
+      language: source.language,
+      sourceFingerprint: source.sourceFingerprint,
+      title,
+      abstract,
+      coverage: { complete: true, fields: 2, translated: Number(title.translated) + Number(abstract.translated) },
+      provenance: { translationVersion: TRANSLATION_VERSION, generatedReadOnly: true,
+        ...translationModelProvenance([...translations.values()]) },
+    };
+  }
+
   async spawnWorker(job, payload, scratch, progress) {
     let model;
     try { model = await configuredResearchModel({ stateRoot: dirname(this.dir) }); }
@@ -1096,7 +1262,7 @@ export class ResearchWorkspace {
         await this.save(id, job).catch(() => {});
       }
     }
-    if (job.status === 'completed' && ['translate', 'translate_annotations'].includes(job.kind) && job.result) {
+    if (job.status === 'completed' && ['translate', 'translate_annotations', 'translate_metadata'].includes(job.kind) && job.result) {
       const retry = this.translationVerificationRetries.get(id);
       if (retry && retry.nextAttemptAt > Date.now()) return retry.view;
       try {
@@ -1107,7 +1273,7 @@ export class ResearchWorkspace {
               typeof job.result.sha256 !== 'string') throw new Error('invalid persisted translation result');
           const current = await this.fulltext(job.result.library, job.result.itemKey, { allowPdfJsFallback: true });
           if (current.sha256 !== job.result.sha256) throw new Error('PDF source changed');
-        } else {
+        } else if (job.kind === 'translate_annotations') {
           if (job.result.format !== 'zotero-workbench/annotation-translations' || job.result.version !== 1 ||
               !Array.isArray(job.result.translations) || !job.result.translations.length) throw new Error('invalid persisted annotation translations');
           const rows = job.result.translations;
@@ -1122,6 +1288,30 @@ export class ResearchWorkspace {
             sourceIds: rows.map(row => row.sourceId),
             sourceVersions: Object.fromEntries(rows.map(row => [row.sourceId, row.fingerprint]))
           });
+        } else {
+          const result = job.result;
+          const validField = field => isRecord(field) &&
+            Object.keys(field).length === 4 &&
+            typeof field.original === 'string' && typeof field.translation === 'string' &&
+            typeof field.translated === 'boolean' && typeof field.available === 'boolean' &&
+            (field.available
+              ? Boolean(field.original && field.translation) &&
+                (field.translated ? field.translation.trim() !== field.original.trim() : field.translation === field.original)
+              : field.original === '' && field.translation === '' && field.translated === false);
+          if (result.format !== 'zotero-workbench/metadata-translation' || result.version !== 1 ||
+              result.targetLanguage !== TRANSLATION_TARGET_LANGUAGE ||
+              !libraryPattern.test(result.library || '') || !keyPattern.test(result.itemKey || '') ||
+              !fingerprintPattern.test(result.sourceFingerprint || '') ||
+              !validField(result.title) || !validField(result.abstract) ||
+              result.coverage?.complete !== true || result.coverage?.fields !== 2 ||
+              result.coverage?.translated !== Number(result.title.translated) + Number(result.abstract.translated))
+            throw new Error('invalid persisted metadata translation');
+          const current = await this.metadataSource(result.library, result.itemKey);
+          if (current.sourceFingerprint !== result.sourceFingerprint ||
+              current.title !== result.title.original || current.abstract !== result.abstract.original ||
+              Boolean(current.title) !== result.title.available || Boolean(current.abstract) !== result.abstract.available ||
+              current.language !== result.language)
+            throw new Error('metadata source changed');
         }
         this.translationVerificationRetries.delete(id);
       } catch {

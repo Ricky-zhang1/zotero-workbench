@@ -1,4 +1,6 @@
 import { CARD_TEMPLATE, ANNOTATION_TEMPLATE } from '../src/domain/workspace.mjs';
+import { zoteroPlainText } from '../src/domain/plain-text.mjs';
+import { metadataRequiresTranslation } from '../src/domain/metadata-translation-heuristic.mjs';
 import { readFile, writeFile, mkdir, cp, readdir } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
@@ -89,6 +91,8 @@ const panelWorkspaceCss = await readFile(resolve(root, 'src/ui/panel-workspace.c
 const panelExtensionCss = await readFile(resolve(root, 'src/ui/panel-extension.css'), 'utf8');
 await mkdir(resolve(root, 'integrations/dsh/web/lib'), { recursive: true });
 await writeFile(resolve(root, 'integrations/dsh/web/lib/research-view.js'), researchViewSource);
+await writeFile(resolve(root, 'integrations/dsh/web/lib/plain-text.js'), await readFile(resolve(root, 'src/domain/plain-text.mjs'), 'utf8'));
+await writeFile(resolve(root, 'integrations/dsh/web/lib/metadata-translation-heuristic.js'), await readFile(resolve(root, 'src/domain/metadata-translation-heuristic.mjs'), 'utf8'));
 await writeFile(resolve(root, 'integrations/dsh/web/research-view.css'), researchViewCss);
 let runtime = await readFile(resolve(vendor, 'dist/server.mjs'), 'utf8');
 // Keep Zotero Extra in list summaries so the maintained library wrapper can
@@ -139,27 +143,51 @@ panelExtensionInline = replaceOnce(panelExtensionInline,
 // Mount the maintained feature component inside the same React tree as the upstream reader.
 panel = replaceOnce(panel,
   'var Sne=si(ds(),1);(0,kne.createRoot)(document.getElementById("root")).render((0,Sne.jsx)(vne,{}));WJ();',
-  `var wbTemplateDefaults=${JSON.stringify({metadata:CARD_TEMPLATE,annotation:ANNOTATION_TEMPLATE})};${highlightPresetsInline}\n${await readFile(resolve(root, 'src/ui/panel-workspace.js'), 'utf8')}\n${await readFile(resolve(root, 'src/ui/panel-actions.js'), 'utf8')}\n${researchViewInline}\n${panelExtensionInline}\n${readerHighlightControlsInline}\nvar Sne=si(ds(),1);(0,kne.createRoot)(document.getElementById("root")).render((0,Sne.jsx)(WorkbenchRoot,{}));WJ();`);
+  `var wbTemplateDefaults=${JSON.stringify({metadata:CARD_TEMPLATE,annotation:ANNOTATION_TEMPLATE})};${highlightPresetsInline}\nvar wbNormalizePlainText=${zoteroPlainText.toString()};var wbMetadataRequiresTranslation=${metadataRequiresTranslation.toString()};\n${await readFile(resolve(root, 'src/ui/panel-workspace.js'), 'utf8')}\n${await readFile(resolve(root, 'src/ui/panel-actions.js'), 'utf8')}\n${researchViewInline}\n${panelExtensionInline}\n${readerHighlightControlsInline}\nvar Sne=si(ds(),1);(0,kne.createRoot)(document.getElementById("root")).render((0,Sne.jsx)(WorkbenchRoot,{}));WJ();`);
 panel = replaceOnce(panel,
   'function XJ({library:t,list:e,s:n,notify:i,footer:s}){let[r,a]=(0,Ks.useState)([]),',
   'function XJ({library:t,list:e,s:n,notify:i,footer:s}){let[r,a]=(0,Ks.useState)([]);(0,Ks.useEffect)(()=>{wbSetSelection(t,r);return()=>wbSetSelection(t,[])},[t,r.join(",")]);let ');
 panel = replaceOnce(panel,
   'function n0e({item:t,selected:e,onToggle:n,onOpen:i,onOpenPdf:s,s:r}){',
-  'function n0e({item:t,selected:e,onToggle:n,onOpen:i,onOpenPdf:s,onOpenDoubleClick:d,s:r}){');
+  'function n0e({library:u,item:t,selected:e,onToggle:n,onOpen:i,onOpenPdf:s,onOpenDoubleClick:d,s:r}){');
+panel = replaceOnce(panel,
+  '(0,Ge.jsx)("span",{className:"item-title",children:t.title})',
+  '(0,Ge.jsx)("span",{className:"item-title",children:wbNormalizePlainText(t.title)})');
+panel = replaceOnce(panel,
+  '(0,Ge.jsx)("span",{className:"item-title",children:wbNormalizePlainText(t.title)}),(0,Ge.jsxs)("span",{className:"item-meta"',
+  '(0,Ge.jsx)("span",{className:"item-title",children:wbNormalizePlainText(t.title)}),(0,Ge.jsx)(WorkbenchMetadataListTitle,{library:u,item:t}),(0,Ge.jsxs)("span",{className:"item-meta"');
+panel = replaceOnce(panel,
+  '"aria-label":t.title,className:"check"',
+  '"aria-label":wbNormalizePlainText(t.title),className:"check"');
 panel = replaceOnce(panel,
   'className:"item-main",onClick:o=>o.metaKey||o.ctrlKey||o.shiftKey?n(o):i(),children:',
   'className:"item-main",onClick:o=>o.metaKey||o.ctrlKey||o.shiftKey?n(o):i(),onDoubleClick:o=>{o.preventDefault(),d()},children:');
 panel = replaceOnce(panel,
   'onOpenPdf:()=>m(p)},p.key)',
   'onOpenPdf:()=>m(p),onOpenDoubleClick:()=>{wbCancelItemOpen();p.pdf?m(p):xf({kind:"item",library:t,key:p.key})}},p.key)');
+panel = replaceOnce(panel,
+  '(0,Ge.jsx)(n0e,{item:p,s:n,selected:r.includes(p.key)',
+  '(0,Ge.jsx)(n0e,{library:t,item:p,s:n,selected:r.includes(p.key)');
 panel = replaceOnce(panel, 'd=p=>xf({kind:"item",library:t,key:p.key}),m=p=>', 'd=p=>{if(wbShouldInspect())a([p.key]);else wbQueueItemOpen(()=>xf({kind:"item",library:t,key:p.key}))},m=p=>');
 // List summaries may carry journalLevels parsed from both Zotero extra and tags.
 panel = replaceOnce(panel,
   'children:[(0,Ge.jsx)("span",{className:"type",children:r.itemTypes[t.itemType]??t.itemType}),a&&(0,Ge.jsx)("span",{className:"ellipsis",children:a})]',
   'children:[(0,Ge.jsx)("span",{className:"type",children:r.itemTypes[t.itemType]??t.itemType}),a&&(0,Ge.jsx)("span",{className:"ellipsis",children:a}),...wbRankChips(t)]');
 panel = replaceOnce(panel,
+  '...wbRankChips(t)]})]}),t.pdf&&(0,Ge.jsx)("button",{type:"button",className:"pdf-chip"',
+  '...wbRankChips(t)]})]}),(0,Ge.jsx)(WorkbenchMetadataListControl,{library:u,item:t}),t.pdf&&(0,Ge.jsx)("button",{type:"button",className:"pdf-chip"');
+panel = replaceOnce(panel,
   '(0,ft.jsx)("p",{className:"muted",children:[c.venue,c.year].filter(Boolean).join(" \\xB7 ")}),(0,ft.jsxs)("div",{className:"actions"',
   '(0,ft.jsx)("p",{className:"muted",children:[c.venue,c.year].filter(Boolean).join(" \\xB7 ")}),wbRankBlock(c,"wb-detail-ranks"),(0,ft.jsxs)("div",{className:"actions"');
+panel = replaceOnce(panel,
+  '(0,ft.jsx)("h2",{className:"detail-title",children:c.title})',
+  '(0,ft.jsx)("h2",{className:"detail-title",children:wbNormalizePlainText(c.title)}),(0,ft.jsx)(WorkbenchMetadataFieldTranslation,{library:t.library,item:c,field:"title",auto:!0})');
+panel = replaceOnce(panel,
+  'children:c.abstract',
+  'children:wbNormalizePlainText(c.abstract)');
+panel = replaceOnce(panel,
+  'children:wbNormalizePlainText(c.abstract)}),c.abstract.length>360',
+  'children:wbNormalizePlainText(c.abstract)}),(0,ft.jsx)(WorkbenchMetadataFieldTranslation,{library:t.library,item:c,field:"abstract"}),c.abstract.length>360');
 // Saving a model-created highlight must enter the existing audited workflow.
 // Reader popover: let the user highlight their own selection and save it directly.
 panel = replaceOnce(panel,

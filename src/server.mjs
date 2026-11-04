@@ -669,7 +669,7 @@ register('research_materials','我的标注与笔记','读取指定分类或文�
 const researchSourceIdSchema = z.string().regex(/^[a-f0-9]{16}$/);
 const researchFingerprintSchema = z.string().regex(/^[a-f0-9]{64}$/);
 const startResearchJobSchema = z.object({
- kind:z.enum(['fold','draft','translate','translate_annotations']),
+ kind:z.enum(['fold','draft','translate','translate_annotations','translate_metadata']),
  library:librarySchema,
  key:keySchema.optional(),
  keys:z.array(keySchema).max(50).optional(),
@@ -685,12 +685,12 @@ const startResearchJobSchema = z.object({
     ids.some(id=>!Object.hasOwn(args.sourceVersions,id)))
    issue(['sourceVersions'],'sourceVersions 必须为每个所选来源提供且仅提供当前指纹。');
  };
- if(args.kind==='fold'||args.kind==='translate'){
+ if(args.kind==='fold'||args.kind==='translate'||args.kind==='translate_metadata'){
   if(!args.key)issue(['key'],`${args.kind} 必须指定单篇文献 key。`);
   if(args.keys!==undefined||args.sourceIds!==undefined||args.sourceVersions!==undefined)
-   issue(['keys'],'全文任务不能混入批注来源参数。');
-  if(args.kind==='translate'&&(args.purpose!==undefined||args.framework!==undefined))
-   issue(['purpose'],'全文翻译不接受写作 purpose 或 framework。');
+   issue(['keys'],'单篇文献任务不能混入批注来源参数。');
+  if(['translate','translate_metadata'].includes(args.kind)&&(args.purpose!==undefined||args.framework!==undefined))
+   issue(['purpose'],`${args.kind} 不接受写作 purpose 或 framework。`);
   return;
  }
  if(args.kind==='draft'){
@@ -711,7 +711,7 @@ const startResearchJobSchema = z.object({
  if(args.sourceIds&&!unique(args.sourceIds))issue(['sourceIds'],'sourceIds 不能重复。');
  if(args.sourceIds)exactVersions(args.sourceIds);
 });
-register('start_research_job','全文阅读、翻译或标注写作','按 kind 执行本机研究任务：fold 完整阅读单篇 PDF 并生成 TextFold 五层与研究导读；translate 生成单篇全文中文对照；translate_annotations 只翻译服务端核验的外文 highlight/underline，单批最多 20 条；draft 只使用研究者勾选的标注。任务调用本机已配置的 Codex CLI，结果仅保存为本机派生材料，不写 Zotero。返回任务 id，使用 research_job 查询结果。',startResearchJobSchema,args=>researchWorkspace.start(args),{readOnly:false});
+register('start_research_job','全文阅读、翻译或标注写作','按 kind 执行本机研究任务：fold 完整阅读单篇 PDF 并生成 TextFold 五层与研究导读；translate 生成单篇全文中文对照；translate_metadata 只从 Zotero 当前条目的标题、摘要和语言读取元数据并生成中文对照，不依赖 PDF；translate_annotations 只翻译服务端核验的外文 highlight/underline，单批最多 20 条；draft 只使用研究者勾选的标注。任务调用本机已配置的 Codex CLI，结果仅保存为本机派生材料，不写 Zotero。返回任务 id，使用 research_job 查询结果。',startResearchJobSchema,args=>researchWorkspace.start(args),{readOnly:false});
 register('research_job','读取研究任务','读取进度、完整的 TextFold 五层结果或带材料回链的初稿。失败/中断不能视为完成。',{id:z.string().regex(/^[a-f0-9]{24}$/)},args=>researchWorkspace.status(args.id));
 register('cancel_research_job','取消研究任务','停止本宿主启动的后台 AI 任务，不删除 Zotero 内容。',{id:z.string().regex(/^[a-f0-9]{24}$/)},args=>researchWorkspace.cancel(args.id),{readOnly:false});
 

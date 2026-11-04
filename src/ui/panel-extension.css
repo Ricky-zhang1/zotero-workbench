@@ -316,3 +316,19 @@
 .wb-collab-pending{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:10px 0;padding:10px 12px;border:1px solid color-mix(in srgb,#9a4d36 35%,var(--z-border));border-radius:7px;font-size:11px}
 @media(max-width:760px){.wb-collab-panel{padding:20px 14px 36px}.wb-context-panel,.wb-context-composer{padding:12px}.wb-context-heading{align-items:flex-start;flex-direction:column;gap:0}}
 @media(max-width:760px){.wb-collab-session-create{grid-template-columns:1fr}.wb-collab-session-restore,.wb-collab-draft-select{align-items:stretch;flex-direction:column}.wb-collab-feedback-form{grid-template-columns:1fr}.wb-collab-feedback-history{grid-column:auto}.wb-collab-claim{margin-left:5px}.wb-collab-pending{align-items:flex-start;flex-direction:column}}
+.wb-metadata-translation-block{display:flex;align-items:flex-start;flex-wrap:wrap;gap:4px 8px;min-width:0;margin:3px 0 8px}
+.wb-metadata-machine-translation{flex:1 1 100%;min-width:0;border-left:2px solid var(--z-border-strong,#b8b2a8);padding-left:8px}
+.wb-metadata-translation-label{display:block;color:color-mix(in srgb,var(--z-fg,#282724) 78%,var(--z-bg,#fff));font-size:11px;line-height:1.5}
+.wb-metadata-translation-text{margin:2px 0 0;color:var(--z-fg,#282724);font:inherit;font-size:13px;line-height:1.65;white-space:pre-wrap;overflow-wrap:anywhere}
+.wb-metadata-translation-action{display:inline-flex;align-items:center;min-height:18px}
+.wb-metadata-translation-status,.wb-metadata-translation-error{color:color-mix(in srgb,var(--z-fg,#282724) 78%,var(--z-bg,#fff));font-size:11px;line-height:1.5}
+.wb-metadata-translation-error{color:var(--z-danger,#9a4d36)}
+.wb-metadata-translation-retry{border:0;background:transparent;color:var(--z-fg2,#615e58);font:inherit;font-size:11px;text-decoration:underline;text-underline-offset:2px;cursor:pointer}
+.wb-metadata-list-translation{display:block;margin-top:3px;font-size:12px;line-height:1.45;color:var(--z-fg2,#615e58);white-space:normal;overflow-wrap:anywhere}
+.wb-metadata-list-translation .wb-metadata-translation-label{font-size:10px}
+.wb-metadata-list-translate{flex:0 0 auto;align-self:center;max-width:100%;border:1px solid var(--z-border-strong,#d6d2ca);border-radius:999px;background:var(--z-card,#faf9f7);color:var(--z-fg2,#615e58);font:inherit;font-size:11px;line-height:1.4;padding:4px 8px;white-space:nowrap;cursor:pointer}
+.wb-metadata-list-translate:hover:not(:disabled){background:var(--z-hover,#f0eee9)}
+.wb-metadata-list-translate:disabled{opacity:.7;cursor:default}
+.item-row .item-main{min-width:0}
+.scroll.detail .abstract{font-family:var(--z-sans,ui-sans-serif,system-ui,sans-serif);font-size:14px;line-height:1.65}
+.wb-inspector .wb-abstract{font-family:var(--z-sans,ui-sans-serif,system-ui,sans-serif);font-size:13px}

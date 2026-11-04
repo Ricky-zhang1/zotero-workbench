@@ -178,6 +178,14 @@ export function createResearchTestGate(policy) {
       return;
     }
 
+    if (args.kind === 'translate_metadata') {
+      if (args.key !== policy.itemKey || args.keys !== undefined ||
+          args.sourceIds !== undefined || args.sourceVersions !== undefined ||
+          Object.keys(args).some(key => !['kind', 'library', 'key'].includes(key)))
+        throw new Error(`Fixture 只允许 ${policy.itemKey} 的元数据翻译任务。`);
+      return;
+    }
+
     if (args.kind === 'translate_annotations') {
       const ids = args.sourceIds;
       const versions = args.sourceVersions;
@@ -190,7 +198,7 @@ export function createResearchTestGate(policy) {
       return;
     }
 
-    throw new Error('Fixture 只允许 fold、translate 或 translate_annotations 研究测试任务。');
+    throw new Error('Fixture 只允许 fold、translate、translate_metadata 或 translate_annotations 研究测试任务。');
   }
 
   function rememberStart(result) {

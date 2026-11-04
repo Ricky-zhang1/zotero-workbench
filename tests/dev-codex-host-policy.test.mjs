@@ -131,18 +131,21 @@ test('research-test flags require one explicit legal Zotero key and a private ab
   ]), /本机私有目录/);
 });
 
-test('fixture defaults to denying AI, then permits only fold/translate for the named item', () => {
+test('fixture defaults to denying AI, then permits fold/translate/metadata translation only for the named item', () => {
   const denied = createResearchTestGate(null);
   assert.throws(() => denied.assertStart({ kind: 'fold', key: RESEARCH_TEST_ITEM }), /默认阻止/);
 
   const gate = createResearchTestGate({ itemKey: RESEARCH_TEST_ITEM, stateDir: '/tmp/archive' });
-  for (const kind of ['fold', 'translate'])
+  for (const kind of ['fold', 'translate', 'translate_metadata'])
     assert.doesNotThrow(() => gate.assertStart({ kind, library: 'user', key: RESEARCH_TEST_ITEM }));
   assert.throws(() => gate.assertStart({ kind: 'draft', library: 'user', key: RESEARCH_TEST_ITEM }), /只允许/);
   assert.throws(() => gate.assertStart({ kind: 'fold', library: 'user', key: 'OTHER001' }), /只允许/);
   assert.throws(() => gate.assertStart({ kind: 'fold', library: 'user', keys: [RESEARCH_TEST_ITEM] }), /只允许/);
   assert.throws(() => gate.assertStart({ kind: 'translate', library: 'g1', key: RESEARCH_TEST_ITEM }), /只允许个人文库/);
   assert.throws(() => gate.assertStart({ kind: 'translate_annotations', library: 'user', keys: [RESEARCH_TEST_ITEM, 'OTHER001'] }), /只允许/);
+  assert.throws(() => gate.assertStart({ kind: 'translate_metadata', library: 'g1', key: RESEARCH_TEST_ITEM }), /只允许个人文库/);
+  assert.throws(() => gate.assertStart({ kind: 'translate_metadata', library: 'user', key: 'OTHER001' }), /只允许/);
+  assert.throws(() => gate.assertStart({ kind: 'translate_metadata', library: 'user', key: RESEARCH_TEST_ITEM, query: 'unexpected' }), /只允许/);
 });
 
 test('annotation translation is capped to the dedicated item and leaves source membership to backend re-read', () => {

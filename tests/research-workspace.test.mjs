@@ -80,6 +80,32 @@ function fakeSession() {
   return session;
 }
 
+function metadataSession({ title = 'Institutional arrangements and local choices',
+  abstractNote = 'Institutions shape how local actors use resources and produce long-term outcomes.',
+  language = 'en', deleted } = {}) {
+  const session = fakeSession();
+  const record = {
+    key: keys.paper1,
+    ...(deleted === undefined ? {} : { deleted }),
+    data: {
+      key: keys.paper1, itemType: 'journalArticle', title, abstractNote, language,
+      ...(deleted === undefined ? {} : { deleted }),
+    },
+  };
+  const originalGetJson = session.client.getJson.bind(session.client);
+  session.requestPaths = [];
+  session.client.getJson = async path => {
+    session.requestPaths.push(path);
+    if (path === `/api/users/0/items/${keys.paper1}`) return { data: { ...record, data: { ...record.data } } };
+    return originalGetJson(path);
+  };
+  session.getMetadataRecord = () => record;
+  session.updateMetadata = patch => Object.assign(record.data, patch);
+  session.pdfTextCalls = 0;
+  session.pdfText = async () => { session.pdfTextCalls++; throw new Error('metadata translation must not read a PDF'); };
+  return session;
+}
+
 async function newStateDir() {
   return mkdtemp(join(tmpdir(), 'zotero-research-test-'));
 }
@@ -620,4 +646,268 @@ test('annotation translation allows Japanese, Korean, and mixed-language excerpt
   const record = packet.papers[0].records.find(item => item.kind === 'highlight');
   await assert.rejects(chineseWorkspace.translationAnnotationSources({ library: 'user', keys: [keys.paper1],
     sourceIds: [record.id], sourceVersions: { [record.id]: record.fingerprint } }), /中文为主/);
+});
+
+test('metadata translation reads only the current Zotero item fields and works without a PDF', async t => {
+  const dir = await newStateDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const session = metadataSession({
+    title: '<span lang="en">Institutional choices</span>',
+    abstractNote: '<p>Local institutions shape <strong>teacher allocation</strong> &amp; later outcomes.</p><script>secret-not-source-text</script>',
+    language: 'zh',
+  });
+  const sourceRecordBefore = JSON.stringify(session.getMetadataRecord());
+  let calls = 0;
+  const workspace = new ResearchWorkspace({ session, stateDir: dir,
+    runner: async payload => {
+      calls++;
+      assert.deepEqual(Object.keys(payload).sort(), ['fields', 'kind']);
+      assert.equal(payload.kind, 'translate_metadata');
+      assert.ok(payload.fields.every(field => Object.keys(field).sort().join(',') === 'id,original,preserveOriginal'));
+      assert.equal(JSON.stringify(payload).includes('secret-not-source-text'), false);
+      assert.equal(JSON.stringify(payload).includes('PAPER001'), false);
+      assert.equal(JSON.stringify(payload).includes('Reader interpretation.'), false);
+      return { translations: payload.fields.map(field => ({ id: field.id, translation: `译文${field.id}` })) };
+    }
+  });
+  const started = await workspace.start({ kind: 'translate_metadata', library: 'user', key: keys.paper1 });
+  await waitForIdle(workspace, started.id);
+  const status = await workspace.status(started.id);
+  assert.equal(status.status, 'completed', status.error);
+  assert.equal(status.result.format, 'zotero-workbench/metadata-translation');
+  assert.equal(status.result.version, 1);
+  assert.equal(status.result.targetLanguage, 'zh-CN');
+  assert.equal(status.result.language, 'zh', 'Zotero language metadata is preserved but does not override text recognition');
+  assert.equal(status.result.library, 'user');
+  assert.equal(status.result.itemKey, keys.paper1);
+  assert.match(status.result.sourceFingerprint, /^[a-f0-9]{64}$/);
+  assert.equal(status.result.title.original, 'Institutional choices');
+  assert.equal(status.result.title.translated, true);
+  assert.equal(status.result.abstract.original, 'Local institutions shape teacher allocation & later outcomes.');
+  assert.equal(status.result.abstract.translated, true);
+  assert.equal(status.result.coverage.complete, true);
+  assert.equal(calls, 1);
+  assert.equal(session.pdfTextCalls, 0);
+  assert.ok(session.requestPaths.every(path => path === `/api/users/0/items/${keys.paper1}`));
+  assert.equal(JSON.stringify(session.getMetadataRecord()), sourceRecordBefore, 'metadata translation never writes the Zotero item');
+
+  const reopened = new ResearchWorkspace({ session, stateDir: dir });
+  const restored = await reopened.status(started.id);
+  assert.equal(restored.status, 'completed');
+  assert.equal(restored.result.sourceFingerprint, status.result.sourceFingerprint,
+    'restored results are shown only after the current Zotero metadata matches');
+});
+
+test('identical active metadata translation requests share one job signature', async t => {
+  const dir = await newStateDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  let entered;
+  let release;
+  const enteredPromise = new Promise(resolve => { entered = resolve; });
+  const resultPromise = new Promise(resolve => { release = resolve; });
+  let calls = 0;
+  const workspace = new ResearchWorkspace({ session: metadataSession(), stateDir: dir,
+    runner: async payload => {
+      calls++;
+      entered();
+      return resultPromise;
+    }
+  });
+  const args = { kind: 'translate_metadata', library: 'user', key: keys.paper1 };
+  const first = await workspace.start(args);
+  await enteredPromise;
+  const duplicate = await workspace.start(args);
+  assert.equal(duplicate.id, first.id);
+  assert.equal(calls, 1);
+  release({ translations: workspace.metadataTranslationBlocks(await workspace.metadataSource('user', keys.paper1))
+    .filter(block => !block.preserveOriginal)
+    .map(block => ({ id: block.id, translation: `统一译文${block.id}` })) });
+  await waitForIdle(workspace, first.id);
+  assert.equal((await workspace.status(first.id)).status, 'completed');
+});
+
+test('metadata translation leaves a missing abstract blank and reuses matching field cache under current identity', async t => {
+  const dir = await newStateDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const session = metadataSession({ abstractNote: '' });
+  let calls = 0;
+  const firstWorkspace = new ResearchWorkspace({ session, stateDir: dir,
+    runner: async payload => {
+      calls++;
+      assert.deepEqual(payload.fields.map(field => field.original), ['Institutional arrangements and local choices']);
+      return { translations: payload.fields.map(field => ({ id: field.id, translation: '制度安排与地方选择' })) };
+    }
+  });
+  const first = await firstWorkspace.start({ kind: 'translate_metadata', library: 'user', key: keys.paper1 });
+  await waitForIdle(firstWorkspace, first.id);
+  const firstResult = (await firstWorkspace.status(first.id)).result;
+  assert.deepEqual(firstResult.abstract, { original: '', translation: '', translated: false, available: false });
+
+  const secondSession = metadataSession({ abstractNote: '' });
+  const secondKey = keys.paper2;
+  const itemForSecond = secondSession.getMetadataRecord();
+  itemForSecond.key = secondKey;
+  itemForSecond.data.key = secondKey;
+  secondSession.client.getJson = async path => {
+    if (path === `/api/users/0/items/${secondKey}`) return { data: { ...itemForSecond, data: { ...itemForSecond.data } } };
+    throw new Error('unexpected metadata request');
+  };
+  secondSession.library.checkVersion = async () => {};
+  const cachedWorkspace = new ResearchWorkspace({ session: secondSession, stateDir: dir,
+    runner: async () => { throw new Error('matching metadata field cache should avoid another model call'); } });
+  const second = await cachedWorkspace.start({ kind: 'translate_metadata', library: 'user', key: secondKey });
+  await waitForIdle(cachedWorkspace, second.id);
+  const secondResult = (await cachedWorkspace.status(second.id)).result;
+  assert.equal(secondResult.itemKey, secondKey);
+  assert.notEqual(secondResult.sourceFingerprint, firstResult.sourceFingerprint);
+  assert.equal(secondResult.title.original, firstResult.title.original);
+  assert.equal(secondResult.title.translation, firstResult.title.translation);
+  assert.equal(calls, 1);
+});
+
+test('metadata source changes hide old results and use only current field cache keys', async t => {
+  const dir = await newStateDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const session = metadataSession();
+  let calls = 0;
+  const workspace = new ResearchWorkspace({ session, stateDir: dir,
+    runner: async payload => {
+      calls++;
+      return { translations: payload.fields.map(field => ({
+        id: field.id,
+        translation: calls === 1 ? '旧译文' : `新译文${calls}`,
+      })) };
+    }
+  });
+  const args = { kind: 'translate_metadata', library: 'user', key: keys.paper1 };
+  const first = await workspace.start(args);
+  await waitForIdle(workspace, first.id);
+  const firstResult = (await workspace.status(first.id)).result;
+  session.updateMetadata({ tags: [{ tag: 'unrelated-tag' }], dateModified: '2099-01-01', language: 'EN' });
+  session.library.version = 99;
+  workspace.translationVerificationRetries.delete(first.id);
+  assert.equal((await workspace.status(first.id)).status, 'completed',
+    'tags, dates, and a changed library version do not alter the metadata source fingerprint');
+  session.updateMetadata({ title: 'A different institutional title', abstractNote: 'A changed abstract about another result.' });
+  workspace.translationVerificationRetries.delete(first.id);
+  const stale = await workspace.status(first.id);
+  assert.equal(stale.status, 'verification_required');
+  assert.equal(Object.hasOwn(stale, 'result'), false);
+
+  const second = await workspace.start(args);
+  await waitForIdle(workspace, second.id);
+  const current = (await workspace.status(second.id)).result;
+  assert.notEqual(current.sourceFingerprint, firstResult.sourceFingerprint);
+  assert.equal(current.title.original, 'A different institutional title');
+  assert.equal(current.abstract.original, 'A changed abstract about another result.');
+  assert.equal(current.title.translation, '新译文2');
+  assert.equal(current.abstract.translation, '新译文2');
+  assert.equal(calls, 2, 'changed field text has a distinct cache key and must be translated');
+});
+
+test('metadata translation skips Chinese prose and does not cache partial model failures', async t => {
+  const dir = await newStateDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const chineseSession = metadataSession({
+    title: 'AI与教育',
+    abstractNote: '<p>制度安排影响行动者选择与跨期结果。</p>',
+    language: 'en',
+  });
+  const chineseWorkspace = new ResearchWorkspace({ session: chineseSession, stateDir: dir,
+    runner: async () => { throw new Error('Chinese fields should not be sent for translation'); } });
+  const chinese = await chineseWorkspace.start({ kind: 'translate_metadata', library: 'user', key: keys.paper1 });
+  await waitForIdle(chineseWorkspace, chinese.id);
+  const chineseResult = (await chineseWorkspace.status(chinese.id)).result;
+  assert.equal(chineseResult.title.original, 'AI与教育');
+  assert.equal(chineseResult.title.translation, chineseResult.title.original);
+  assert.equal(chineseResult.title.translated, false);
+  assert.equal(chineseResult.abstract.translated, false);
+  assert.equal(chineseSession.pdfTextCalls, 0);
+
+  const failedSession = metadataSession();
+  const failedWorkspace = new ResearchWorkspace({ session: failedSession, stateDir: dir,
+    runner: async () => { throw new Error('private model output and source text'); } });
+  const failed = await failedWorkspace.start({ kind: 'translate_metadata', library: 'user', key: keys.paper1 });
+  await waitForIdle(failedWorkspace, failed.id);
+  const failedStatus = await failedWorkspace.status(failed.id);
+  assert.equal(failedStatus.status, 'failed');
+  assert.doesNotMatch(failedStatus.error, /private model output|source text/);
+  assert.equal(await failedWorkspace.readTranslationCache(fingerprint('Institutional arrangements and local choices')), null);
+  assert.equal(await failedWorkspace.readTranslationCache(fingerprint('Institutions shape how local actors use resources and produce long-term outcomes.')), null);
+});
+
+test('metadata heuristic handles mixed title and abstract fields independently of Zotero language', async t => {
+  const dir = await newStateDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const shortChineseTitle = 'AI与教育';
+  const englishAbstract = 'Local institutions shape choices and long-term outcomes.';
+  const firstSession = metadataSession({ title: shortChineseTitle, abstractNote: englishAbstract, language: 'en' });
+  const firstWorkspace = new ResearchWorkspace({ session: firstSession, stateDir: dir,
+    runner: async payload => {
+      assert.deepEqual(payload.fields.map(field => field.original), [englishAbstract]);
+      return { translations: payload.fields.map(field => ({ id: field.id, translation: '地方制度影响选择与长期结果。' })) };
+    }
+  });
+  const first = await firstWorkspace.start({ kind: 'translate_metadata', library: 'user', key: keys.paper1 });
+  await waitForIdle(firstWorkspace, first.id);
+  const firstResult = (await firstWorkspace.status(first.id)).result;
+  assert.equal(firstResult.title.translation, shortChineseTitle);
+  assert.equal(firstResult.title.translated, false);
+  assert.equal(firstResult.abstract.translated, true);
+
+  const englishTitle = 'Institutional change and local school staffing';
+  const longChineseAbstract = '地方制度安排经由组织资源配置影响学校行动者的选择，并在连续的时间过程中形成后续配置结果。';
+  const secondSession = metadataSession({ title: englishTitle, abstractNote: longChineseAbstract, language: 'zh' });
+  const secondWorkspace = new ResearchWorkspace({ session: secondSession, stateDir: dir,
+    runner: async payload => {
+      assert.deepEqual(payload.fields.map(field => field.original), [englishTitle]);
+      assert.equal(JSON.stringify(payload).includes(longChineseAbstract), false);
+      return { translations: payload.fields.map(field => ({ id: field.id, translation: '制度变迁与地方学校教师配置' })) };
+    }
+  });
+  const second = await secondWorkspace.start({ kind: 'translate_metadata', library: 'user', key: keys.paper1 });
+  await waitForIdle(secondWorkspace, second.id);
+  const secondResult = (await secondWorkspace.status(second.id)).result;
+  assert.equal(secondResult.title.translated, true);
+  assert.equal(secondResult.abstract.translation, longChineseAbstract);
+  assert.equal(secondResult.abstract.translated, false);
+});
+
+test('metadata changed during the model call cannot yield a result or successful translation cache', async t => {
+  const dir = await newStateDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const session = metadataSession({ title: 'A distinct source title for race checking', abstractNote: '' });
+  const original = 'A distinct source title for race checking';
+  const workspace = new ResearchWorkspace({ session, stateDir: dir,
+    runner: async payload => {
+      session.updateMetadata({ title: 'The Zotero title changed while translation was running.' });
+      return { translations: payload.fields.map(field => ({ id: field.id, translation: '过期标题译文' })) };
+    }
+  });
+  const started = await workspace.start({ kind: 'translate_metadata', library: 'user', key: keys.paper1 });
+  await waitForIdle(workspace, started.id);
+  const status = await workspace.status(started.id);
+  assert.equal(status.status, 'failed');
+  assert.match(status.error, /翻译期间发生变化/);
+  assert.equal(Object.hasOwn(status, 'result'), false);
+  assert.equal(await workspace.readTranslationCache(fingerprint(original)), null);
+});
+
+test('metadata reads reject deleted and indeterminate Zotero item states', async t => {
+  const dir = await newStateDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  for (const deleted of [true, 1, '1', 'unknown', null]) {
+    const session = metadataSession({ deleted });
+    const workspace = new ResearchWorkspace({ session, stateDir: dir });
+    await assert.rejects(workspace.metadataSource('user', keys.paper1), /无法确认所选 Zotero 文献/);
+  }
+  const missingIdentitySession = metadataSession();
+  const originalGetJson = missingIdentitySession.client.getJson;
+  missingIdentitySession.client.getJson = async path => {
+    const response = await originalGetJson(path);
+    if (path === `/api/users/0/items/${keys.paper1}`) delete response.data.key;
+    return response;
+  };
+  const missingIdentityWorkspace = new ResearchWorkspace({ session: missingIdentitySession, stateDir: dir });
+  await assert.rejects(missingIdentityWorkspace.metadataSource('user', keys.paper1), /无法确认所选 Zotero 文献/);
 });

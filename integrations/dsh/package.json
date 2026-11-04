@@ -1,9 +1,9 @@
 {
   "name": "zotero-workbench-dsh",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "private": true,
   "type": "module",
-  "description": "DeepSeek Harness Zotero 工作台与阅读器：支持标注写作、TextFold 五层阅读与研究导读、全文和外文高亮中文对照。翻译使用本机已配置的 Codex CLI（非 DSH 原生模型）；TextFold 需运行仓库根目录 scripts/setup-research.py。",
+  "description": "DeepSeek Harness Zotero 工作台与阅读器：支持标注写作、TextFold 五层阅读与研究导读、标题摘要、全文和外文高亮中文对照。翻译使用本机已配置的 Codex CLI（非 DSH 原生模型）；TextFold 需运行仓库根目录 scripts/setup-research.py。",
   "main": "index.js",
   "exports": {
     ".": "./index.js",

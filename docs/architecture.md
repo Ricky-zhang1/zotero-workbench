@@ -218,3 +218,7 @@ src/
 ResearchWorkspace继续只读Zotero来源，并管理私有派生任务。翻译由纯Node translation-worker调用已配置Codex CLI，TextFold保留锁定的Python解析与五层引擎。research-model-config集中读取可选后台阅读模型；不改全局模型、服务或账号。译文按原文指纹/目标语言/算法版本缓存，并以本次真实读取重绑来源；恢复时重新核验，离线不毁掉成功快照。
 
 研究视图共享于Codex/DSH，分组不改变材料身份。勾选只保存id和fingerprint，重新读取后才恢复；自动翻译与研究导读不自动变成人工写作语料。原文/批注/备注/笔记/机器译文的显示边界与来源记录相互独立。
+
+## 1.2.2 元数据双语
+
+translate_metadata是ResearchWorkspace的只读元数据任务，直接重读当前Zotero条目的title/abstractNote/language，不进入PDF提取或写入通道。字段按共同纯文本规则显示，单独判定是否外文，译文按原文字段缓存；结果保留两字段原文、译文、可用状态、身份和来源指纹，恢复前再次核验。Codex列表与详情共享进行中任务，未知摘要不当作空摘要清除缓存；DSH沿用同一模型任务与结果契约。机器译文只作阅读辅助，不自动加入人工写作来源。

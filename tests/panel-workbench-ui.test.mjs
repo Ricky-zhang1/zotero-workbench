@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import vm from 'node:vm';
 import * as wbHighlightPresets from '../src/ui/highlight-presets.js';
+import { zoteroPlainText } from '../src/domain/plain-text.mjs';
+import { metadataRequiresTranslation } from '../src/domain/metadata-translation-heuristic.mjs';
 
 const root = new URL('../', import.meta.url);
 const [workspaceSource, extensionSource, extensionCss, buildSource, pinnedPanel] = await Promise.all([
@@ -31,6 +33,8 @@ let collaborationSessionResponse = null;
 let collaborationFeedbackResponse = null;
 let readAnnotationCommentHandler = null;
 let updateAnnotationCommentHandler = null;
+let metadataTranslationStartHandler = null;
+let metadataTranslationJobHandler = null;
 let readerAnnotationDocument = { annotations: [] };
 const annotationResourceCache = new Map();
 const readerAnnotationRefreshes = [];
@@ -72,6 +76,8 @@ const en = {
       return readAnnotationCommentHandler ? readAnnotationCommentHandler(args) : { status: 'ready', ...args, comment: '', annotationVersion: 1, editable: true, editToken: 'e'.repeat(48), lastOperation: null };
     if (name === 'update_reader_annotation_comment')
       return updateAnnotationCommentHandler ? updateAnnotationCommentHandler(args) : { status: 'verified', verified: true, changed: true, ...args, comment: args.comment, annotationVersion: args.expectedVersion + 1, operationId: 'd'.repeat(64) };
+    if (name === 'start_research_job' && metadataTranslationStartHandler) return metadataTranslationStartHandler(args);
+    if (name === 'research_job' && metadataTranslationJobHandler) return metadataTranslationJobHandler(args);
     if (name === 'research_materials') return researchMaterialsResponse;
     if (name === 'collaboration_session') {
       if (args.action === 'list') return { sessions: [] };
@@ -116,6 +122,23 @@ const context = {
   console,
 };
 const plain = (value) => JSON.parse(JSON.stringify(value));
+function metadataTranslationResult({ library='user', key='PAPER001', titleOriginal='Foreign research title', titleTranslation='中文题名', abstractOriginal='', abstractTranslation='', language='' }={}) {
+  const titleTranslated=titleTranslation!==titleOriginal;
+  const abstractTranslated=abstractOriginal.length>0&&abstractTranslation!==abstractOriginal;
+  const field=(original,translation,translated)=>({original,translation,translated,available:original.length>0});
+  return {
+    format:'zotero-workbench/metadata-translation',version:1,targetLanguage:'zh-CN',library,itemKey:key,language,
+    sourceFingerprint:'f'.repeat(64),
+    title:field(titleOriginal,titleTranslation,titleTranslated),
+    abstract:field(abstractOriginal,abstractOriginal?abstractTranslation:'',abstractTranslated),
+    coverage:{complete:true,fields:2,translated:Number(titleTranslated)+Number(abstractTranslated)},
+    provenance:{translationVersion:'zotero-workbench-zh-v1',generatedReadOnly:true},
+  };
+}
+function resetMetadataTranslationHarness(){
+  metadataTranslationStartHandler=null;metadataTranslationJobHandler=null;
+  context.uiTest.wbMetadataTranslations.clear();
+}
 async function resetTrashState() {
   context.uiTest.wbReaderTrashInFlight.clear();
   context.uiTest.wbResetReaderTrashLedger();
@@ -128,7 +151,7 @@ async function resetTrashState() {
   });
 }
 vm.createContext(context);
-vm.runInContext(`${workspaceSource}\n${extensionSource}\nglobalThis.uiTest = { wbConnectionSummary, wbStartConnectionStatusRequest, wbRankLabels, wbRankLevels, wbRankTone, wbRankBlock, wbInspectorItem, wbAnnotationSource, wbAnnotationPrompt, wbAddAnnotationContext, wbRefreshAnnotationContextComment, wbAddAnnotationContexts, wbAskAnnotation, wbRemoveAnnotationContext, wbClearAnnotationContext, wbContextSnapshot, wbContextKey, wbContextPayload, wbContextMetadata, wbSendAnnotationContextMessage, wbReadCollaborationMaterialRecords, wbCollaborationSourceSelectors, wbListCollaborationSessions, wbListCollaborationFeedback, wbLoadCollaborationSession, wbLoadCollaborationDraft, wbCollaborationDecisionLabel, wbCollaborationRangeLabel, wbCollaborationContextSources, wbCollaborationSourceStatus, wbCollaborationSourceReference, wbReplaceContextWithCollaborationSession, wbSetCollaborationContextSession, wbCollaborationFeedbackMessage, wbSendCollaborationFeedbackMessage, WorkbenchCollaboration, wbPrepareAnnotationTrash, wbConfirmAnnotationTrash, wbRememberTrashedAnnotation, wbTrackReaderTrashOperation, wbPrepareAnnotationRestore, wbConfirmAnnotationRestore, wbReconcileAnnotationOperation, wbTrashReaderAnnotationsBatch, wbRemoveReaderAnnotationOnce, wbUndoReaderAnnotationRemoval, wbReaderTrashOperationIds, wbReaderTrashAttempt, wbReaderTrashInFlight, wbSetReaderTrashLedgerOperations, wbReadReaderTrashOperations, wbResetReaderTrashLedger, wbReaderTrashLedgerOperation, wbSelectableReaderAnnotations, wbSelectedReaderAnnotations, wbSelectedReaderHighlights, wbReaderAnnotationSelectionToggle, wbReaderAnnotationSelectionForRoute, wbReaderAnnotationCopyText, wbCopyReaderAnnotations, wbReaderTrashErrorResult, wbReaderAnnotationCommentInFlight, wbReaderAnnotationCommentAttempts, wbReadReaderAnnotationComment, wbSaveReaderAnnotationComment, WorkbenchReaderAnnotationComment, wbOpenTarget, wbOpenTargetWithFeedback, WorkbenchAnnotationRestore, wbQueueItemOpen, wbCancelItemOpen };`, context);
+vm.runInContext(`var wbNormalizePlainText=${zoteroPlainText.toString()};var wbMetadataRequiresTranslation=${metadataRequiresTranslation.toString()};\n${workspaceSource}\n${extensionSource}\nglobalThis.uiTest = { wbNormalizePlainText, wbMetadataNeedsTranslation, wbMetadataTranslationKey, wbMetadataTranslationState, wbMetadataTranslations, wbRequestMetadataTranslation, wbValidateMetadataTranslation, WorkbenchMetadataFieldTranslation, WorkbenchMetadataListTitle, WorkbenchMetadataListControl, wbConnectionSummary, wbStartConnectionStatusRequest, wbRankLabels, wbRankLevels, wbRankTone, wbRankBlock, wbInspectorItem, wbAnnotationSource, wbAnnotationPrompt, wbAddAnnotationContext, wbRefreshAnnotationContextComment, wbAddAnnotationContexts, wbAskAnnotation, wbRemoveAnnotationContext, wbClearAnnotationContext, wbContextSnapshot, wbContextKey, wbContextPayload, wbContextMetadata, wbSendAnnotationContextMessage, wbReadCollaborationMaterialRecords, wbCollaborationSourceSelectors, wbListCollaborationSessions, wbListCollaborationFeedback, wbLoadCollaborationSession, wbLoadCollaborationDraft, wbCollaborationDecisionLabel, wbCollaborationRangeLabel, wbCollaborationContextSources, wbCollaborationSourceStatus, wbCollaborationSourceReference, wbReplaceContextWithCollaborationSession, wbSetCollaborationContextSession, wbCollaborationFeedbackMessage, wbSendCollaborationFeedbackMessage, WorkbenchCollaboration, wbPrepareAnnotationTrash, wbConfirmAnnotationTrash, wbRememberTrashedAnnotation, wbTrackReaderTrashOperation, wbPrepareAnnotationRestore, wbConfirmAnnotationRestore, wbReconcileAnnotationOperation, wbTrashReaderAnnotationsBatch, wbRemoveReaderAnnotationOnce, wbUndoReaderAnnotationRemoval, wbReaderTrashOperationIds, wbReaderTrashAttempt, wbReaderTrashInFlight, wbSetReaderTrashLedgerOperations, wbReadReaderTrashOperations, wbResetReaderTrashLedger, wbReaderTrashLedgerOperation, wbSelectableReaderAnnotations, wbSelectedReaderAnnotations, wbSelectedReaderHighlights, wbReaderAnnotationSelectionToggle, wbReaderAnnotationSelectionForRoute, wbReaderAnnotationCopyText, wbCopyReaderAnnotations, wbReaderTrashErrorResult, wbReaderAnnotationCommentInFlight, wbReaderAnnotationCommentAttempts, wbReadReaderAnnotationComment, wbSaveReaderAnnotationComment, WorkbenchReaderAnnotationComment, wbOpenTarget, wbOpenTargetWithFeedback, WorkbenchAnnotationRestore, wbQueueItemOpen, wbCancelItemOpen };`, context);
 
 function createHookHarness(component, initialProps) {
   const originalAr = context.ar;
@@ -180,6 +203,130 @@ async function resetAnnotationCommentHarness() {
   context.uiTest.wbReaderAnnotationCommentAttempts.clear();
   await context.uiTest.wbClearAnnotationContext();
 }
+
+test('Zotero plain-text normalization strips display markup without losing formulas and is embedded in the panel', () => {
+  assert.equal(zoteroPlainText('<span class="title">Education &amp; Policy</span>'), 'Education & Policy');
+  assert.equal(zoteroPlainText('<p>First&nbsp;line</p><div>Next &lt; value</div>'), 'First line\n\nNext < value');
+  assert.equal(zoteroPlainText('x < y, y > 0'), 'x < y, y > 0');
+  assert.equal(zoteroPlainText('x < p, p > 0'), 'x < p, p > 0');
+  assert.equal(zoteroPlainText('<script>alert(1)</script><style>p{display:none}</style>e\u0301\u0000'), 'é');
+  const malformed='<span '+('x'.repeat(30000));
+  const started=performance.now();
+  assert.equal(zoteroPlainText(malformed),malformed);
+  assert.ok(performance.now()-started<500,'a long unterminated tag should return in linear time');
+  assert.equal(context.uiTest.wbNormalizePlainText('<span>title</span>'),'title');
+  assert.ok(buildSource.includes('var wbNormalizePlainText=${zoteroPlainText.toString()}'));
+  assert.ok(workspaceSource.includes('wbNormalizePlainText(item.title)'));
+  assert.ok(workspaceSource.includes('wbNormalizePlainText(item.abstract)'));
+  assert.ok(buildSource.includes('children:wbNormalizePlainText(t.title)'));
+  assert.ok(buildSource.includes('children:wbNormalizePlainText(c.title)'));
+  assert.ok(buildSource.includes('children:wbNormalizePlainText(c.abstract)'));
+  assert.ok(!buildSource.includes('dangerouslySetInnerHTML'));
+});
+
+test('metadata translation classifies title and abstract independently and skips Chinese metadata', async () => {
+  resetMetadataTranslationHarness();
+  assert.equal(context.uiTest.wbMetadataNeedsTranslation({ title:'中文标题', abstract:'中文摘要。' }), false);
+  assert.equal(context.uiTest.wbMetadataNeedsTranslation({ title:'AI 与教育', abstract:'中文摘要。' }), false);
+  assert.equal(context.uiTest.wbMetadataNeedsTranslation({ title:'English title', abstract:'中文摘要。' }), true);
+  assert.equal(context.uiTest.wbMetadataNeedsTranslation({ title:'中文标题', abstract:'English abstract.' }), true);
+  assert.equal(await context.uiTest.wbRequestMetadataTranslation('user', { key:'PAPER001', title:'中文标题', abstract:'中文摘要。' }), null);
+  for(const itemType of ['attachment','note','annotation']){
+    const item={key:'PAPER001',itemType,title:'Foreign filename or note',abstract:'Foreign text'};
+    assert.equal(context.uiTest.wbMetadataNeedsTranslation(item),false);
+    assert.equal(await context.uiTest.wbRequestMetadataTranslation('user',item),null);
+  }
+  assert.equal(bridgeCalls.some(call=>call.name==='start_research_job'),false);
+});
+
+test('list and detail share one metadata job without snapshot resets when the list lacks an abstract', async () => {
+  resetMetadataTranslationHarness();
+  const listItem={key:'PAPER001',title:'<span class="title">Foreign research title</span>'};
+  const detailItem={key:'PAPER001',title:'Foreign research title',abstract:'Foreign abstract'};
+  const starts=[];let releaseStart;
+  metadataTranslationStartHandler=args=>{starts.push(args);return new Promise(resolve=>{releaseStart=resolve;});};
+  const listRequest=context.uiTest.wbRequestMetadataTranslation('user',listItem,{retry:true});
+  const detailRequest=context.uiTest.wbRequestMetadataTranslation('user',detailItem,{automatic:true});
+  assert.equal(starts.length,1,'simultaneous list and detail views share the in-flight task');
+  assert.deepEqual(plain(starts[0]),{kind:'translate_metadata',library:'user',key:'PAPER001'});
+  const result=metadataTranslationResult({titleOriginal:'Foreign research title',abstractOriginal:'Foreign abstract',abstractTranslation:'中文摘要'});
+  releaseStart({id:'1'.repeat(24),status:'completed',result});
+  await Promise.all([listRequest,detailRequest]);
+  assert.equal(listItem.title,'<span class="title">Foreign research title</span>','HTML is cleaned for display without mutating Zotero source fields');
+  const forList=context.uiTest.wbMetadataTranslationState('user','PAPER001',listItem);
+  const forDetail=context.uiTest.wbMetadataTranslationState('user','PAPER001',detailItem);
+  assert.equal(forList,forDetail);
+  assert.equal(forDetail.result.abstract.translation,'中文摘要');
+  const before=context.uiEvents.length;
+  assert.equal(context.uiTest.wbMetadataTranslationState('user','PAPER001',detailItem),forDetail);
+  assert.equal(context.uiEvents.length,before,'reading shared state during render does not dispatch or reset it');
+  const titleHarness=createHookHarness(context.uiTest.WorkbenchMetadataListTitle,{library:'user',item:listItem});
+  assert.match(treeText(titleHarness.render()),/中文题名/);
+  titleHarness.restore();
+  const changedDetail={...detailItem,abstract:'A changed abstract'};
+  assert.equal(context.uiTest.wbMetadataTranslationState('user','PAPER001',changedDetail),null,'a changed known field hides the old translation');
+  assert.equal(context.uiTest.wbMetadataTranslations.get('user/PAPER001'),forDetail,'a read-only render check never replaces the shared entry');
+});
+
+test('metadata translation works without a PDF, leaves an empty abstract unavailable, and reuses the verified job on revisit', async () => {
+  resetMetadataTranslationHarness();
+  const item={key:'PAPER002',title:'Foreign title',abstract:''};
+  const starts=[],reads=[];
+  metadataTranslationStartHandler=args=>{starts.push(args);return {id:'2'.repeat(24),status:'completed',result:metadataTranslationResult({key:'PAPER002',titleOriginal:'Foreign title',abstractOriginal:''})};};
+  metadataTranslationJobHandler=args=>{reads.push(args);return {id:args.id,status:'completed',result:metadataTranslationResult({key:'PAPER002',titleOriginal:'Foreign title',abstractOriginal:''})};};
+  const first=await context.uiTest.wbRequestMetadataTranslation('user',item,{automatic:true});
+  assert.equal(starts.length,1);
+  assert.equal(first.result.abstract.available,false);
+  assert.equal(first.result.abstract.translation,'');
+  const revisit=await context.uiTest.wbRequestMetadataTranslation('user',item,{automatic:true});
+  assert.equal(starts.length,1,'the backend verifies the saved job ID instead of starting a second model task');
+  assert.equal(reads.length,1);
+  assert.equal(revisit.status,'completed');
+});
+
+test('metadata verification rechecks the same saved job, while genuine task failure waits for explicit retry', async () => {
+  resetMetadataTranslationHarness();
+  const item={key:'PAPER003',title:'Foreign title',abstract:''};
+  const starts=[];let checks=0;
+  metadataTranslationStartHandler=args=>{starts.push(args);return {id:'3'.repeat(24),status:'verification_required',error:'来源待核验'};};
+  metadataTranslationJobHandler=()=>{checks++;return {id:'3'.repeat(24),status:'completed',result:metadataTranslationResult({key:'PAPER003',titleOriginal:'Foreign title'})};};
+  const pending=await context.uiTest.wbRequestMetadataTranslation('user',item,{automatic:true});
+  assert.equal(pending.status,'verification_required');
+  assert.equal(pending.result,null);
+  const verified=await context.uiTest.wbRequestMetadataTranslation('user',item,{retry:true});
+  assert.equal(verified.status,'completed');
+  assert.equal(starts.length,1,'source recheck does not rerun the model');
+  assert.equal(checks,1);
+
+  resetMetadataTranslationHarness();
+  let attempts=0;
+  metadataTranslationStartHandler=()=>++attempts===1?{id:'4'.repeat(24),status:'failed',error:'模型暂不可用'}:{id:'5'.repeat(24),status:'completed',result:metadataTranslationResult({key:'PAPER003',titleOriginal:'Foreign title'})};
+  const failed=await context.uiTest.wbRequestMetadataTranslation('user',item,{automatic:true});
+  assert.equal(failed.status,'failed');
+  await context.uiTest.wbRequestMetadataTranslation('user',item,{automatic:true});
+  assert.equal(attempts,1,'failure is not retried on rerender');
+  const retried=await context.uiTest.wbRequestMetadataTranslation('user',item,{retry:true});
+  assert.equal(retried.status,'completed');
+  assert.equal(attempts,2);
+});
+
+test('metadata list action is a standalone button and isolates click and double-click events', () => {
+  resetMetadataTranslationHarness();
+  const item={key:'PAPER004',title:'Foreign title'};
+  const harness=createHookHarness(context.uiTest.WorkbenchMetadataListControl,{library:'user',item});
+  const button=harness.render();
+  assert.equal(button.type,'button');
+  assert.equal(treeText(button),'翻译标题与摘要');
+  const calls=[];
+  button.props.onClick({preventDefault:()=>calls.push('prevent'),stopPropagation:()=>calls.push('stop')});
+  button.props.onDoubleClick({preventDefault:()=>calls.push('preventDouble'),stopPropagation:()=>calls.push('stopDouble')});
+  assert.deepEqual(calls,['prevent','stop','preventDouble','stopDouble']);
+  harness.restore();
+  assert.ok(buildSource.includes('WorkbenchMetadataListControl,{library:u,item:t}),t.pdf&&'));
+  assert.ok(buildSource.includes('WorkbenchMetadataListTitle,{library:u,item:t}'));
+  assert.ok(buildSource.includes('WorkbenchMetadataFieldTranslation,{library:t.library,item:c,field:"title",auto:!0}'));
+  assert.ok(buildSource.includes('field:"abstract"'));
+});
 
 test('connection indicator follows local Zotero API and treats external Zotero MCP as optional', () => {
   const disconnectedMcp = context.uiTest.wbConnectionSummary({

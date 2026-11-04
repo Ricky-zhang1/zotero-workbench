@@ -7,6 +7,7 @@ import {
   MAX_TRANSLATION_BLOCK_CHARS, buildTranslationBlocks, requiresTranslation, runTranslationWorker,
   validateTranslationOutput, validateTranslationPayload
 } from '../src/domain/translation-worker.mjs';
+import { metadataRequiresTranslation } from '../src/domain/metadata-translation-heuristic.mjs';
 
  test('fulltext blocks preserve exact contiguous text, whitespace boundaries, and surrogate pairs', () => {
   const source = `${'a'.repeat(3990)} boundary ${'b'.repeat(4020)}`;
@@ -22,14 +23,27 @@ import {
     'a surrogate pair must not be split across blocks');
 });
 
-test('Chinese prose and symbol-only blocks can be explicit pass-through while mixed source remains translatable', () => {
+test('legacy fulltext and annotation heuristic remains unchanged', () => {
   assert.equal(requiresTranslation('制度安排影响地方行动者的选择。'), false);
+  assert.equal(requiresTranslation('AI与教育'), true, 'the metadata-specific rule must not change the legacy threshold');
   assert.equal(requiresTranslation('∑ xᵢ = 0; 2024–2026'), false);
   assert.equal(requiresTranslation('中文解释；however, institutions shape actual outcomes.'), true);
   assert.equal(requiresTranslation('制度的配置が地方の選択を変える。'), true);
   assert.equal(requiresTranslation('조직의 자원 배분은 교사의 선택을 바꾼다.'), true);
   assert.equal(requiresTranslation('Институциональные условия меняют решения местных акторов.'), true);
   assert.equal(requiresTranslation('تؤثر المؤسسات في اختيارات الفاعلين المحليين.'), true);
+});
+
+test('metadata heuristic uses visible text rather than Zotero language and preserves Chinese-led short titles', () => {
+  const inlineMetadataRequiresTranslation = new Function(`return (${metadataRequiresTranslation.toString()})`)();
+  assert.equal(inlineMetadataRequiresTranslation('AI与教育'), false, 'the predicate can be embedded without module imports');
+  assert.equal(metadataRequiresTranslation('AI与教育'), false);
+  assert.equal(metadataRequiresTranslation('Institutional Change'), true);
+  assert.equal(metadataRequiresTranslation('地方制度与教师配置'), false);
+  assert.equal(metadataRequiresTranslation('制度安排 shapes local choices and outcomes.'), true);
+  assert.equal(metadataRequiresTranslation('制度の配置が地方の選択を変える。'), true);
+  assert.equal(metadataRequiresTranslation('조직의 자원 배분은 교사의 선택을 바꾼다.'), true);
+  assert.equal(metadataRequiresTranslation('∑ xᵢ = 0; 2024–2026'), false);
 });
 
 test('translation output requires exact ID coverage and flags only permitted unchanged blocks', () => {
@@ -53,6 +67,56 @@ test('translation output requires exact ID coverage and flags only permitted unc
   assert.throws(() => validateTranslationOutput(payload, { translations: rows.slice(0, 2) }), /条数不完整/);
 });
 
+test('metadata translation uses opaque IDs and permits only explicit untranslated pass-through', () => {
+  const payload = { kind: 'translate_metadata', fields: [
+    { id: '0123456789abcdef', original: 'An English paper title.', preserveOriginal: false },
+    { id: 'fedcba9876543210', original: 'AI与教育', preserveOriginal: true },
+  ] };
+  assert.deepEqual(validateTranslationPayload(payload), payload.fields);
+  const result = validateTranslationOutput(payload, { translations: [
+    { id: 'fedcba9876543210', translation: 'AI与教育', unchanged: true },
+    { id: '0123456789abcdef', translation: '一篇关于制度的英文论文题目。', unchanged: false },
+  ] });
+  assert.equal(result[0].id, '0123456789abcdef');
+  assert.equal(result[1].unchanged, true);
+  assert.throws(() => validateTranslationPayload({ kind: 'translate_metadata', fields: [
+    { id: '0123456789abcdef', original: 'Institutional Change', preserveOriginal: true }
+  ] }), /翻译条目标识或原文无效/);
+  assert.throws(() => validateTranslationOutput(payload, { translations: [
+    { id: '0123456789abcdef', translation: 'An English paper title.', unchanged: true },
+    { id: 'fedcba9876543210', translation: 'AI与教育', unchanged: true },
+  ] }), /外文翻译结果与原文相同/);
+});
+
+test('Node translation worker sends metadata fields through the existing Codex adapter', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'metadata-translation-worker-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const executable = join(dir, 'mock-codex');
+  const capturedPrompt = join(dir, 'prompt.json');
+  const oldCodex = process.env.ZOTERO_WORKBENCH_CODEX;
+  process.env.ZOTERO_WORKBENCH_CODEX = executable;
+  t.after(() => oldCodex === undefined
+    ? delete process.env.ZOTERO_WORKBENCH_CODEX
+    : (process.env.ZOTERO_WORKBENCH_CODEX = oldCodex));
+  await writeFile(executable,
+    `#!/bin/sh\nOUTPUT=''\nwhile [ "$#" -gt 0 ]; do\n  if [ "$1" = '-o' ]; then shift; OUTPUT="$1"; fi\n  shift\ndone\ncat > '${capturedPrompt}'\nprintf '{"translations":[{"id":"0123456789abcdef","translation":"一篇英文论文标题的中文译文。"}]}' > "$OUTPUT"\n`,
+    { mode: 0o700 });
+  await chmod(executable, 0o700);
+  const payload = { kind: 'translate_metadata', fields: [
+    { id: '0123456789abcdef', original: 'An English paper title.', preserveOriginal: false }
+  ] };
+  const result = await runTranslationWorker({
+    job: { status: 'running' }, payload, scratch: join(dir, 'work'), model: null
+  });
+  assert.deepEqual(result.translations, [
+    { id: '0123456789abcdef', translation: '一篇英文论文标题的中文译文。', unchanged: false }
+  ]);
+  const prompt = await readFile(capturedPrompt, 'utf8');
+  assert.ok(prompt.includes('An English paper title.'));
+  assert.ok(prompt.includes('0123456789abcdef'));
+  assert.equal(prompt.includes('PAPER001'), false);
+});
+
 test('translation payload bounds fulltext size and annotation batch count without truncation', () => {
   const fulltext = { kind: 'translate', blocks: Array.from({ length: 501 }, (_, index) => ({
     id: `p1-b${index + 1}`, original: 'x', preserveOriginal: true,
@@ -67,6 +131,9 @@ test('translation payload bounds fulltext size and annotation batch count withou
   assert.throws(() => validateTranslationPayload({ kind: 'translate_annotations', sources: [
     { id: '0123456789abcdef', original: 'x'.repeat(12001) }
   ] }), /单条外文摘录过长/);
+  assert.throws(() => validateTranslationPayload({ kind: 'translate_metadata', fields: [
+    { id: '0123456789abcdef', original: 'x'.repeat(MAX_TRANSLATION_BLOCK_CHARS + 1), preserveOriginal: false }
+  ] }), /超过长度上限/);
 });
 
 test('translation CLI passes the optional model locally and exposes only known safe failure guidance', async t => {
