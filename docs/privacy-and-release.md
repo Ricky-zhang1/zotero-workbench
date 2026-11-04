@@ -9,3 +9,5 @@
 工作台和固定ZCode上游保留MIT许可；TextFold保留Apache-2.0 LICENSE/NOTICE；PDF.js第三方声明和内置Node许可随包分发。可选Python依赖PyMuPDF适用其自身AGPL/商业许可，不随基础便携包分发。本项目不提供法律判断或任意闭源组合的商业许可承诺。
 
 1.0.0为开源预览：原版工具和资源入口的保留不等于所有平台、PDF及写入场景均已真机通过。发布说明明确已验证和未验证部分，商业与全平台稳定性尚未背书。
+
+TextFold 自动任务另需 Poppler 的 `pdftotext`（例如 Ubuntu 的 `poppler-utils`）；它不内置于基础便携包。CI 显式安装此可选研究依赖，以执行真实双栏提取检查。基础阅读界面不因此要求安装 Poppler；PDF.js 无法定位的特殊字体文本仍可能需要该回退依赖。

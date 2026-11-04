@@ -9,3 +9,5 @@ macOS arm64 有真实运行时冷启动和只读连接验证；Windows x64 包�
 升级前保存当前工作并完整退出 Codex，安装后重新打开。不要在旧 MCP 进程仍运行时清理旧资源；维护安装器会阻断这种情况。ZIP 内的权限应完整保留；不要靠删库、删操作台账解决升级失败。
 
 开发者：Node24构建源码，Python运行package-portable.py打包；默认只下载官方固定Node发行物并核对校验和，支持--archive/--shasums离线提供已下载的官方档案。基础包不包含PyMuPDF或Python环境。
+
+TextFold 自动任务另需 Poppler 的 `pdftotext`（例如 Ubuntu 的 `poppler-utils`）；它不内置于基础便携包。CI 显式安装此可选研究依赖，以执行真实双栏提取检查。基础阅读界面不因此要求安装 Poppler；PDF.js 无法定位的特殊字体文本仍可能需要该回退依赖。

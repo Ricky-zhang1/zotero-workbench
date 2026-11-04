@@ -42,3 +42,5 @@ python3 scripts/package-portable.py --target darwin-arm64
 工作台及固定 ZCode 上游遵循 MIT；TextFold 保留 Apache-2.0 LICENSE/NOTICE，PDF.js 与 Node 的许可声明随各自资源分发。可选 PyMuPDF 适用其自身许可，不包含在基础便携包中。本项目不宣称整个依赖组合适用于任意闭源再分发。
 
 欢迎提交 issue 和 PR；请使用虚构文献复现问题，不上传私人 PDF、笔记、账号或 API key。更新请注明变更和实际验证范围，未通过的验收保持可见。
+
+TextFold 自动任务另需 Poppler 的 `pdftotext`（例如 Ubuntu 的 `poppler-utils`）；它不内置于基础便携包。CI 显式安装此可选研究依赖，以执行真实双栏提取检查。基础阅读界面不因此要求安装 Poppler；PDF.js 无法定位的特殊字体文本仍可能需要该回退依赖。

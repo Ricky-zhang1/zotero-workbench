@@ -27,3 +27,5 @@ Zotero 写入需要在 Zotero 中批准权限。工作台的标准操作先显�
 - 主程序构建与191项自动检查通过（提版前0.14.1实现），1.0.0公共副本另行重建复核。
 - 官方Node24.22.2便携包已真实空PATH/隔离用户目录启动，57个MCP工具、面板HTML和本机Zotero只读连接通过；可选MCP关闭时标准文库写能力仍走本地API。此检查不写Zotero，也不是Codex原生UI完整验收。
 - Windows等平台不作已验证承诺。
+
+TextFold 自动任务另需 Poppler 的 `pdftotext`（例如 Ubuntu 的 `poppler-utils`）；它不内置于基础便携包。CI 显式安装此可选研究依赖，以执行真实双栏提取检查。基础阅读界面不因此要求安装 Poppler；PDF.js 无法定位的特殊字体文本仍可能需要该回退依赖。
