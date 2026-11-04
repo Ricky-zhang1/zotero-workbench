@@ -1,0 +1,26 @@
+{
+  "name": "zotero-workbench",
+  "version": "1.0.0",
+  "description": "连接本机 Zotero 与已有 Zotero MCP，提供文库浏览、PDF 阅读、引用核查与导出；支持标注写作和 TextFold 五层阅读（需本机 Codex CLI 与研究运行环境）。",
+  "author": {
+    "name": "Zhang Ruizhe"
+  },
+  "license": "MIT",
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Zotero 文献工作台",
+    "shortDescription": "文库、标注写作与 TextFold 阅读",
+    "longDescription": "连接本机 Zotero 与已有 Zotero MCP，提供文库浏览、PDF 阅读、引用核查与导出；支持标注写作和 TextFold 五层阅读（需本机 Codex CLI 与研究运行环境）。",
+    "developerName": "Zhang Ruizhe",
+    "category": "Research",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": "打开 Zotero 文献工作台",
+    "logo": "./assets/icon.png",
+    "composerIcon": "./assets/icon.png"
+  }
+}

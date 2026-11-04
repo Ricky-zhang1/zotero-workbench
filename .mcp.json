@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "zotero-workbench": {
+      "command": "node",
+      "args": [
+        "${CODEX_PLUGIN_ROOT}/src/server.mjs"
+      ]
+    }
+  }
+}

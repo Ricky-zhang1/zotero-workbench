@@ -1,0 +1,16 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "zotero-workbench": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "${PLUGIN_ROOT}/src/server.mjs"
+      ],
+      "env": {
+        "ZOTERO_URL": "http://127.0.0.1:23119",
+        "ZOTERO_MCP_URL": "http://127.0.0.1:23120/mcp"
+      }
+    }
+  }
+}

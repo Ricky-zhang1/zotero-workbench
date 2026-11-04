@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="referrer" content="no-referrer" />
+    <title>Zotero 文献工作台</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23b31b1b'/%3E%3Ctext x='16' y='22' font-family='-apple-system,sans-serif' font-size='17' font-weight='700' fill='%23fff' text-anchor='middle'%3EZ%3C/text%3E%3C/svg%3E" />
+    <script>
+      // 首帧先按父页面主题选 light/dark，避免加载时闪白/闪黑；精确变量同步由 lib/theme.js 负责。
+      (function () {
+        try {
+          var p = window.parent;
+          var cs = p.getComputedStyle(p.document.documentElement);
+          var scheme = String(cs.colorScheme || cs.getPropertyValue('color-scheme') || '').toLowerCase();
+          var dark;
+          if (scheme.indexOf('dark') >= 0 && scheme.indexOf('light') < 0) dark = true;
+          else if (scheme.indexOf('light') >= 0 && scheme.indexOf('dark') < 0) dark = false;
+          else dark = p.matchMedia('(prefers-color-scheme: dark)').matches;
+          document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+        } catch (e) {
+          try {
+            document.documentElement.dataset.theme = window.matchMedia('(prefers-color-scheme: dark)').matches
+              ? 'dark'
+              : 'light';
+          } catch (e2) {
+            /* 保持默认 light */
+          }
+        }
+      })();
+    </script>
+    <link rel="stylesheet" href="./app.css" />
+    <link rel="stylesheet" href="./research-view.css" />
+  </head>
+  <body>
+    <div id="app" class="app" data-boot="loading">
+      <!-- ===== 顶栏 ===== -->
+      <header class="app-bar">
+        <div class="brand" aria-hidden="true">
+          <span class="brand-mark">Z</span>
+          <span class="brand-name">Zotero 文献</span>
+        </div>
+        <button
+          id="toggle-library"
+          class="icon-btn library-toggle"
+          type="button"
+          aria-label="展开文库"
+          aria-expanded="false"
+          aria-controls="library-panel"
+          title="文库"
+        ></button>
+        <div class="library-picker">
+          <label class="sr-only" for="library-select">文库</label>
+          <select id="library-select" class="select select-inline" title="文库"></select>
+        </div>
+        <div class="app-bar-spacer"></div>
+        <div id="health-status" class="health-status" role="status" aria-live="polite">
+          <span class="health-dot" aria-hidden="true"></span>
+          <span class="health-text">连接中…</span>
+        </div>
+        <button
+          id="open-workspace"
+          class="icon-btn"
+          type="button"
+          aria-label="打开完整工作台"
+          title="打开完整工作台"
+        ></button>
+        <button id="refresh-btn" class="icon-btn" type="button" aria-label="刷新文库与当前条目" title="刷新（R）"></button>
+        <button
+          id="toggle-annotations"
+          class="icon-btn"
+          type="button"
+          aria-label="显示或隐藏批注面板"
+          aria-pressed="true"
+          title="批注面板"
+        ></button>
+      </header>
+
+      <div class="app-body" id="app-body">
+        <!-- 窄侧边栏（≤760px）下展开文库时的遮罩 -->
+        <div id="drawer-scrim" class="drawer-scrim" hidden aria-hidden="true"></div>
+        <!-- ===== 左侧：文库 ===== -->
+        <aside id="library-panel" class="library-panel" aria-label="文库面板">
+          <div class="search-box">
+            <span class="search-icon" aria-hidden="true"></span>
+            <label class="sr-only" for="search-input">搜索文献</label>
+            <input
+              id="search-input"
+              class="search-input"
+              type="search"
+              placeholder="搜索标题、作者、全文…（/）"
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <button id="clear-search" class="search-clear" type="button" aria-label="清空搜索" hidden></button>
+          </div>
+          <div class="search-options">
+            <label class="check">
+              <input id="fulltext-toggle" type="checkbox" />
+              <span>全文搜索</span>
+            </label>
+            <span class="search-hint" aria-hidden="true">Esc 退出搜索</span>
+          </div>
+
+          <nav id="collections" class="collections" aria-label="分类与收藏"></nav>
+
+          <div class="list-toolbar">
+            <label class="sr-only" for="sort-select">排序</label>
+            <select id="sort-select" class="select" title="排序方式">
+              <option value="dateModified">最近修改</option>
+              <option value="dateAdded">最近添加</option>
+              <option value="title">标题</option>
+              <option value="year">年份</option>
+            </select>
+            <span id="result-count" class="result-count" role="status" aria-live="polite"></span>
+          </div>
+
+          <div id="items-scroll" class="items-scroll">
+            <ol id="item-list" class="item-list" role="listbox" aria-label="文献列表"></ol>
+            <div id="items-footer" class="items-footer"></div>
+          </div>
+        </aside>
+
+        <!-- ===== 中间：阅读区 ===== -->
+        <main class="reader" aria-label="阅读区">
+          <header id="reader-head" class="reader-head"></header>
+
+          <div id="reader-toolbar" class="reader-toolbar" hidden>
+            <div class="tool-group" role="group" aria-label="翻页">
+              <button id="prev-page" class="icon-btn" type="button" aria-label="上一页（←）" title="上一页（←）"></button>
+              <div class="page-box">
+                <label class="sr-only" for="page-input">页码</label>
+                <input id="page-input" class="page-input" type="text" inputmode="numeric" value="1" aria-label="当前页码" />
+                <span class="page-total">/ <span id="page-total">1</span></span>
+              </div>
+              <button id="next-page" class="icon-btn" type="button" aria-label="下一页（→）" title="下一页（→）"></button>
+            </div>
+            <div class="tool-sep" aria-hidden="true"></div>
+            <div class="tool-group" role="group" aria-label="缩放">
+              <button id="zoom-out" class="icon-btn" type="button" aria-label="缩小" title="缩小"></button>
+              <span id="zoom-label" class="zoom-label" aria-live="polite">—</span>
+              <button id="zoom-in" class="icon-btn" type="button" aria-label="放大" title="放大"></button>
+              <button id="fit-width" class="btn btn-quiet" type="button" aria-pressed="true" title="适合宽度">适合宽度</button>
+            </div>
+            <div class="tool-sep" aria-hidden="true"></div>
+            <div class="tool-group tool-attachment" role="group" aria-label="PDF 附件">
+              <label class="sr-only" for="attachment-select">PDF 附件</label>
+              <select id="attachment-select" class="select select-inline" hidden></select>
+            </div>
+            <div class="tool-spacer"></div>
+            <a id="open-pdf" class="btn btn-quiet" href="#" target="_blank" rel="noopener noreferrer" title="在新窗口打开 PDF">新窗口打开</a>
+          </div>
+
+          <div id="pdf-stage" class="pdf-stage">
+            <div id="pdf-scroll" class="pdf-scroll">
+              <div id="pdf-page" class="pdf-page" aria-label="PDF 页面"></div>
+            </div>
+
+            <div id="stage-overlay" class="stage-overlay" hidden>
+              <div class="stage-card">
+                <div class="spinner" aria-hidden="true"></div>
+                <p id="stage-overlay-text" class="stage-text">正在加载…</p>
+              </div>
+            </div>
+
+            <div id="stage-empty" class="stage-empty">
+              <div class="stage-empty-icon" aria-hidden="true"></div>
+              <h2>打开一篇文献</h2>
+              <p>从左侧文库选择文献，这里会显示 PDF 页面与批注。</p>
+              <ul class="tips">
+                <li><kbd>/</kbd> 聚焦搜索</li>
+                <li><kbd>←</kbd> <kbd>→</kbd> 翻页</li>
+                <li>选中 PDF 文字后可复制</li>
+              </ul>
+            </div>
+
+            <div id="stage-error" class="stage-error" hidden>
+              <div class="stage-error-icon" aria-hidden="true"></div>
+              <h2 id="stage-error-title">加载失败</h2>
+              <p id="stage-error-message"></p>
+              <button id="stage-retry" class="btn" type="button">重试</button>
+            </div>
+          </div>
+        </main>
+
+        <!-- ===== 右侧：批注 ===== -->
+        <aside id="annotation-panel" class="annotation-panel" aria-label="批注面板">
+          <div class="panel-head">
+            <span class="panel-title">批注 <span id="annotation-count" class="count-badge">0</span></span>
+            <button id="annotation-close" class="icon-btn" type="button" aria-label="关闭批注面板" title="关闭（Esc）"></button>
+          </div>
+          <div id="annotation-body" class="annotation-body">
+            <div id="annotation-list" class="annotation-list" role="list"></div>
+            <div id="notes-section" class="notes-section"></div>
+          </div>
+        </aside>
+      </div>
+    </div>
+
+    <!-- 全页工作区（?mode=workspace）：由 lib/workspace-app.js 渲染 -->
+    <div id="workspace-root" class="workspace-root" hidden></div>
+
+    <!-- 选中文字后的复制气泡 -->
+    <div id="copy-pop" class="copy-pop" hidden>
+      <button id="copy-selection-btn" class="copy-btn" type="button"></button>
+    </div>
+
+    <!-- 提示条 -->
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+    <!-- 启动 / 严重错误遮罩 -->
+    <div id="boot-screen" class="boot-screen">
+      <div class="boot-card">
+        <div id="boot-spinner" class="spinner spinner-lg" aria-hidden="true"></div>
+        <div id="boot-icon" class="boot-icon" aria-hidden="true" hidden></div>
+        <h1 id="boot-title">Zotero 文献工作台</h1>
+        <p id="boot-message">正在连接本机 Zotero…</p>
+        <div class="boot-actions">
+          <button id="boot-retry" class="btn" type="button" hidden>重试连接</button>
+        </div>
+        <p id="boot-hint" class="boot-hint"></p>
+      </div>
+    </div>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

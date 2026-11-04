@@ -1,0 +1,29 @@
+# DeepSeek Harness 侧接入：两行
+# 1) zotero-workbench-mcp：用 stdio 启动 zotero-workbench 标准 MCP 服务器（本体仍是 ../../src/server.mjs）。
+# 2) zotero-workbench-panel：本包自己的 Host 半侧（HTTP 只读路由 /zotero-workbench/*）
+#    + Client 半侧（client.js，在 dsh-better-sidebar 的右侧边栏注册「Zotero 文献」tab）。
+# 注意：本文件含本机绝对路径（node / 服务器入口 / cwd / PATH）；换机器按 README 修改。
+- insert:
+    - id: zotero-workbench-mcp
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: zotero_workbench
+        transport: stdio
+        command: '/opt/homebrew/bin/node'
+        args:
+          - '/absolute/path/to/zotero-workbench/src/server.mjs'
+        cwd: '/absolute/path/to/zotero-workbench'
+        env:
+          ZOTERO_URL: 'http://127.0.0.1:23119'
+          ZOTERO_MCP_URL: 'http://127.0.0.1:23120/mcp'
+          # DSH 的子进程环境会剔除 KEY/PASSWORD/SECRET/TOKEN 类变量与 DSH_*；
+          # PATH 在 DSH 从 Finder 启动时可能不含 Homebrew/conda，而服务器需要
+          # spawn python3（zotero-lattics 证据审计），因此显式给出 PATH。
+          PATH: '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/example/.local/miniconda3/bin:/Users/example/.nvm/versions/node/v24.12.0/bin'
+        # PDF 全文/批注读取在超大文档上可能超过默认 60s。
+        toolCallTimeoutMs: 180000
+        # 服务器是惰性连接 Zotero 的，Zotero 未启动也不应导致插件激活失败；
+        # true 只用于把 node 路径/入口错误在安装时暴露出来。
+        failOnStartupError: true
+    - id: zotero-workbench-panel
+      name: 'zotero-workbench-dsh'
