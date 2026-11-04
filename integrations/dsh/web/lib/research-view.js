@@ -59,6 +59,11 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
 
   const document = host.ownerDocument;
   const library = scope?.library || 'user';
+  let activeScope = scope && typeof scope === 'object' ? {
+    library,
+    ...(Array.isArray(scope.keys) ? { keys: unique(scope.keys) } : {}),
+    ...(scope.collection ? { collection: scope.collection, recursive: scope.recursive !== false } : {}),
+  } : null;
   const app = el(document, 'section', 'rw');
   app.setAttribute('aria-label', '研究工作台');
   host.replaceChildren(app);
@@ -81,6 +86,14 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
     readError: '',
     copyMessage: '',
     showAllSelected: false,
+    scopePickerOpen: false,
+    scopeMode: activeScope?.collection ? 'collection' : 'paper',
+    scopeCollections: [],
+    scopeResults: [],
+    scopeTotal: 0,
+    scopeQuery: '',
+    scopeLoading: false,
+    scopeError: '',
   };
 
   let disposed = false;
@@ -88,15 +101,18 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
   let jobEpoch = 0;
   let pollTimer = null;
   let recoveryStarted = false;
+  let scopeLookupEpoch = 0;
   let draftComposer = null;
-  const normalizedKeys = Array.isArray(scope?.keys) ? unique(scope.keys).sort() : null;
-  const scopeSignature = stableHash(JSON.stringify({
-    library,
-    keys: normalizedKeys,
-    collection: scope?.collection || null,
-    recursive: scope?.collection ? scope.recursive !== false : null,
-  }));
-  const jobStorageKey = `zotero-workbench-research-jobs:${library}:${scopeSignature}`;
+  function jobStorageKeyFor(scopeValue = activeScope) {
+    const normalizedKeys = Array.isArray(scopeValue?.keys) ? unique(scopeValue.keys).sort() : null;
+    const scopeSignature = stableHash(JSON.stringify({
+      library,
+      keys: normalizedKeys,
+      collection: scopeValue?.collection || null,
+      recursive: scopeValue?.collection ? scopeValue.recursive !== false : null,
+    }));
+    return `zotero-workbench-research-jobs:${library}:${scopeSignature}`;
+  }
   const ZOTERO_COLOR_CLASSES = new Map([
     ['#ffd400', 'rw-zotero-yellow'],
     ['#ffff00', 'rw-zotero-yellow-legacy'],
@@ -152,27 +168,29 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
     return ZOTERO_COLOR_CLASSES.get(value.toLowerCase()) || '';
   }
 
-  function saveJobReference(job, kind) {
+  function saveJobReference(job, kind, scopeValue = activeScope) {
     try {
       const storage = document.defaultView.localStorage;
-      const refs = JSON.parse(storage.getItem(jobStorageKey) || '[]');
+      const storageKey = jobStorageKeyFor(scopeValue);
+      const refs = JSON.parse(storage.getItem(storageKey) || '[]');
       const reference = { id: job.id, kind, library, updatedAt: Date.now() };
       const next = Array.isArray(refs) ? refs.filter(ref => ref.id !== job.id) : [];
       next.push(reference);
-      storage.setItem(jobStorageKey, JSON.stringify(next));
+      storage.setItem(storageKey, JSON.stringify(next));
     } catch {
       // The panel can still run; persistence is an optional reload convenience.
     }
   }
 
-  function removeJobReference(id) {
+  function removeJobReference(id, scopeValue = activeScope) {
     try {
       const storage = document.defaultView.localStorage;
-      const refs = JSON.parse(storage.getItem(jobStorageKey) || '[]');
+      const storageKey = jobStorageKeyFor(scopeValue);
+      const refs = JSON.parse(storage.getItem(storageKey) || '[]');
       if (!Array.isArray(refs)) return;
       const next = refs.filter(reference => reference.id !== id);
-      if (next.length) storage.setItem(jobStorageKey, JSON.stringify(next));
-      else storage.removeItem(jobStorageKey);
+      if (next.length) storage.setItem(storageKey, JSON.stringify(next));
+      else storage.removeItem(storageKey);
     } catch {
       // Ignore storage being unavailable.
     }
@@ -180,6 +198,11 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
 
   async function readMaterials() {
     const epoch = ++loadEpoch;
+    const requestScope = activeScope ? {
+      ...activeScope,
+      ...(Array.isArray(activeScope.keys) ? { keys: [...activeScope.keys] } : {}),
+    } : null;
+    const requestLibrary = requestScope?.library || library;
     state.loading = true;
     state.papers = [];
     state.errors = [];
@@ -190,7 +213,7 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
     state.readError = '';
     render();
 
-    if (!scope || (!Array.isArray(scope.keys) && !scope.collection)) {
+    if (!requestScope || (!Array.isArray(requestScope.keys) && !requestScope.collection)) {
       state.loading = false;
       render();
       return;
@@ -203,12 +226,12 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
       while (current(epoch)) {
         if (seenOffsets.has(offset)) throw new Error('分页位置重复，已停止读取以避免遗漏。');
         seenOffsets.add(offset);
-        const args = { library, limit: 10, offset };
+        const args = { library: requestLibrary, limit: 10, offset };
         if (scopeId) args.scopeId = scopeId;
-        else if (Array.isArray(scope.keys) && scope.keys.length) args.keys = scope.keys;
+        else if (Array.isArray(requestScope.keys) && requestScope.keys.length) args.keys = requestScope.keys;
         else {
-          args.collection = scope.collection;
-          args.recursive = scope.recursive !== false;
+          args.collection = requestScope.collection;
+          args.recursive = requestScope.recursive !== false;
         }
 
         const packet = await call('research_materials', args);
@@ -289,7 +312,7 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
     recoveryStarted = true;
     let refs;
     try {
-      refs = JSON.parse(document.defaultView.localStorage.getItem(jobStorageKey) || '[]');
+      refs = JSON.parse(document.defaultView.localStorage.getItem(jobStorageKeyFor()) || '[]');
     } catch {
       return;
     }
@@ -323,6 +346,7 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
 
   async function startJob(kind, args) {
     if (state.job && !TERMINAL.has(state.job.status)) return;
+    const jobScope = activeScope;
     const epoch = ++jobEpoch;
     if (pollTimer) clearTimeout(pollTimer);
     pollTimer = null;
@@ -333,10 +357,11 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
     render();
     try {
       const started = await call('start_research_job', args);
+      if (!disposed && epoch !== jobEpoch && started?.id) saveJobReference(started, kind, jobScope);
       if (disposed || epoch !== jobEpoch) return;
       if (!started?.id) throw new Error('研究服务未返回任务编号。');
       state.job = { ...started, kind };
-      saveJobReference(started, kind);
+      saveJobReference(started, kind, jobScope);
       render();
       beginPolling(started.id, kind, epoch);
     } catch (error) {
@@ -414,6 +439,213 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
     return box;
   }
 
+  function scopeItemLabel() {
+    if (!Array.isArray(activeScope?.keys) || activeScope.keys.length !== 1) return '';
+    const key = activeScope.keys[0];
+    return state.papers.find(paper => paper.itemKey === key)?.title || key;
+  }
+
+  function scopeTitle() {
+    const libraryName = library === 'user' ? '个人文库' : `群组 ${library}`;
+    if (activeScope?.collection) {
+      const name = state.scopeCollections.find(collection => collection.key === activeScope.collection)?.name || activeScope.collection;
+      return `${libraryName} · 分类 ${name}`;
+    }
+    if (Array.isArray(activeScope?.keys) && activeScope.keys.length === 1)
+      return `${libraryName} · 文献 ${state.scopeItemLabel || scopeItemLabel()}`;
+    if (Array.isArray(activeScope?.keys) && activeScope.keys.length > 1)
+      return `${libraryName} · 指定 ${activeScope.keys.length} 篇文献`;
+    return `${libraryName} · 选择材料范围`;
+  }
+
+  function selectedItemUrl(itemKey) {
+    const prefix = library === 'user' ? 'library' : `groups/${library.slice(1)}`;
+    return `zotero://select/${prefix}/items/${itemKey}`;
+  }
+
+  function responseData(value) {
+    return value?.structuredContent || value?.structured || value;
+  }
+
+  function closeScopePicker() {
+    scopeLookupEpoch += 1;
+    state.scopePickerOpen = false;
+    state.scopeLoading = false;
+    state.scopeError = '';
+    render();
+  }
+
+  async function loadScopeCollections() {
+    const epoch = ++scopeLookupEpoch;
+    state.scopeLoading = true;
+    state.scopeError = '';
+    render();
+    try {
+      const packet = responseData(await call('list_collections', { library }));
+      if (disposed || epoch !== scopeLookupEpoch || !state.scopePickerOpen || state.scopeMode !== 'collection') return;
+      if (!Array.isArray(packet?.collections)) throw new Error('分类列表格式不完整。');
+      state.scopeCollections = packet.collections;
+    } catch (error) {
+      if (disposed || epoch !== scopeLookupEpoch) return;
+      state.scopeError = error?.message || String(error);
+    } finally {
+      if (!disposed && epoch === scopeLookupEpoch) {
+        state.scopeLoading = false;
+        render();
+      }
+    }
+  }
+
+  async function searchScopeItems() {
+    const epoch = ++scopeLookupEpoch;
+    state.scopeLoading = true;
+    state.scopeError = '';
+    render();
+    try {
+      const args = { library, mode: 'titleCreatorYear', limit: 20, start: 0 };
+      if (state.scopeQuery.trim()) args.query = state.scopeQuery.trim();
+      const packet = responseData(await call('search_library', args));
+      if (disposed || epoch !== scopeLookupEpoch || !state.scopePickerOpen || state.scopeMode !== 'paper') return;
+      if (!Array.isArray(packet?.items)) throw new Error('文献搜索结果格式不完整。');
+      state.scopeResults = packet.items;
+      state.scopeTotal = Number.isFinite(packet.total) ? packet.total : packet.items.length;
+    } catch (error) {
+      if (disposed || epoch !== scopeLookupEpoch) return;
+      state.scopeError = error?.message || String(error);
+    } finally {
+      if (!disposed && epoch === scopeLookupEpoch) {
+        state.scopeLoading = false;
+        render();
+      }
+    }
+  }
+
+  function setScopeMode(mode) {
+    state.scopeMode = mode;
+    state.scopeError = '';
+    if (mode === 'collection') void loadScopeCollections();
+    else void searchScopeItems();
+  }
+
+  function openScopePicker() {
+    state.scopePickerOpen = true;
+    state.scopeMode = activeScope?.collection ? 'collection' : 'paper';
+    state.scopeQuery = '';
+    state.scopeResults = [];
+    state.scopeError = '';
+    render();
+    if (state.scopeMode === 'collection') void loadScopeCollections();
+    else void searchScopeItems();
+  }
+
+  function chooseMaterialScope(nextScope, label = '') {
+    scopeLookupEpoch += 1;
+    activeScope = { library, ...nextScope };
+    state.scopeItemLabel = nextScope.keys?.length === 1 ? label : '';
+    state.scopePickerOpen = false;
+    state.scopeLoading = false;
+    state.scopeError = '';
+    state.scopeResults = [];
+    state.result = null;
+    state.job = null;
+    state.openSources.clear();
+    state.showAllSelected = false;
+    state.view = 'annotations';
+    recoveryStarted = false;
+    jobEpoch += 1;
+    if (pollTimer) clearTimeout(pollTimer);
+    pollTimer = null;
+    void readMaterials();
+    void recoverJob();
+  }
+
+  function collectionOptions() {
+    const children = new Map();
+    for (const collection of state.scopeCollections) {
+      const parent = collection.parent || null;
+      if (!children.has(parent)) children.set(parent, []);
+      children.get(parent).push(collection);
+    }
+    for (const values of children.values()) values.sort((a, b) => text(a.name).localeCompare(text(b.name)));
+    const rows = [];
+    const visit = (parent, depth, visited) => {
+      for (const collection of children.get(parent) || []) {
+        if (visited.has(collection.key)) continue;
+        rows.push({ collection, depth });
+        const next = new Set(visited);
+        next.add(collection.key);
+        visit(collection.key, depth + 1, next);
+      }
+    };
+    visit(null, 0, new Set());
+    return rows;
+  }
+
+  function renderScopePicker() {
+    const picker = el(document, 'section', 'rw-scope-picker');
+    picker.setAttribute('aria-label', '选择研究材料范围');
+    const heading = el(document, 'div', 'rw-scope-picker-heading');
+    heading.append(el(document, 'strong', '', '研究范围'));
+    heading.append(button('取消', 'rw-link-button', closeScopePicker));
+    picker.append(heading);
+
+    const modes = el(document, 'div', 'rw-scope-modes');
+    for (const [id, label] of [['collection', '分类'], ['paper', '文献']]) {
+      modes.append(button(label, `rw-pill${state.scopeMode === id ? ' is-active' : ''}`, () => setScopeMode(id), {
+        pressed: state.scopeMode === id,
+      }));
+    }
+    picker.append(modes);
+
+    if (state.scopeMode === 'collection') {
+      picker.append(el(document, 'p', 'rw-muted', '选择一个分类，读取该分类及子分类中的文献标注。'));
+      const options = el(document, 'div', 'rw-scope-options');
+      for (const { collection, depth } of collectionOptions()) {
+        const option = button(`${'　'.repeat(Math.min(depth, 6))}${collection.name || collection.key} · ${collection.numItems ?? 0}`, 'rw-scope-option', () => {
+          chooseMaterialScope({ collection: collection.key, recursive: true });
+        });
+        option.dataset.key = collection.key;
+        option.setAttribute('aria-current', String(activeScope?.collection === collection.key));
+        options.append(option);
+      }
+      if (!state.scopeLoading && !state.scopeError && !state.scopeCollections.length)
+        options.append(el(document, 'p', 'rw-muted', '文库中没有可选分类。'));
+      picker.append(options);
+    } else {
+      const searchRow = el(document, 'div', 'rw-scope-search');
+      const input = el(document, 'input', 'rw-scope-search-input');
+      input.type = 'search';
+      input.maxLength = 300;
+      input.placeholder = '搜索题名、作者；留空显示最近文献';
+      input.value = state.scopeQuery;
+      input.setAttribute('aria-label', '搜索文献');
+      input.addEventListener('input', () => { state.scopeQuery = input.value; });
+      input.addEventListener('keydown', event => { if (event.key === 'Enter') void searchScopeItems(); });
+      searchRow.append(input);
+      searchRow.append(button('搜索', 'rw-button rw-button-muted', () => void searchScopeItems(), { disabled: state.scopeLoading }));
+      picker.append(searchRow);
+      if (!state.scopeQuery.trim()) picker.append(el(document, 'p', 'rw-muted', '显示最近文献；输入关键词后可搜索题名和作者。'));
+      if (state.scopeTotal > state.scopeResults.length)
+        picker.append(el(document, 'p', 'rw-muted', `显示 ${state.scopeResults.length} 篇，共 ${state.scopeTotal} 篇匹配结果。`));
+      const options = el(document, 'div', 'rw-scope-options');
+      for (const item of state.scopeResults) {
+        const option = button(item.title || item.key, 'rw-scope-option', () => {
+          chooseMaterialScope({ keys: [item.key] }, item.title || item.key);
+        });
+        option.dataset.key = item.key;
+        option.append(el(document, 'span', 'rw-scope-option-key', item.key));
+        options.append(option);
+      }
+      if (!state.scopeLoading && !state.scopeError && !state.scopeResults.length)
+        options.append(el(document, 'p', 'rw-muted', '没有找到文献。'));
+      picker.append(options);
+    }
+
+    if (state.scopeLoading) picker.append(el(document, 'p', 'rw-muted', '正在读取文库…'));
+    if (state.scopeError) picker.append(el(document, 'p', 'rw-alert', state.scopeError));
+    return picker;
+  }
+
   function renderTop() {
     const header = el(document, 'header', 'rw-header');
     const titleLine = el(document, 'div', 'rw-title-line');
@@ -435,9 +667,17 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
     header.append(nav);
 
     const scopeLine = el(document, 'div', 'rw-scope-line');
-    scopeLine.append(tag('◫', library === 'user' ? '个人文库' : `群组 ${library}`, 'rw-scope-tag'));
-    if (scope?.collection) scopeLine.append(tag('▤', `分类 ${scope.collection}`, 'rw-scope-tag'));
-    if (Array.isArray(scope?.keys) && scope.keys.length === 1) scopeLine.append(tag('▧', '指定文献', 'rw-scope-tag'));
+    const scopeControl = el(document, 'div', 'rw-scope-control');
+    scopeControl.append(button(scopeTitle(), 'rw-scope-trigger', openScopePicker, {
+      pressed: state.scopePickerOpen,
+      label: '更改研究范围；可选择文库分类或指定文献',
+    }));
+    if (Array.isArray(activeScope?.keys) && activeScope.keys.length === 1) {
+      const key = activeScope.keys[0];
+      scopeControl.append(button('打开文献', 'rw-link-button', () => requestRead({ library, itemKey: key, url: selectedItemUrl(key) })));
+    }
+    if (state.scopePickerOpen) scopeControl.append(renderScopePicker());
+    scopeLine.append(scopeControl);
     if (state.readError) scopeLine.append(el(document, 'span', 'rw-alert rw-alert-inline', state.readError));
     header.append(scopeLine);
     const job = renderJobStatus();
@@ -528,6 +768,9 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
     heading.append(select);
     heading.append(el(document, 'h3', '', paper.title || paper.itemKey));
     heading.append(badge('材料', paper.records?.length || 0));
+    heading.append(button('打开文献', 'rw-link-button', () => requestRead({
+      library, itemKey: paper.itemKey, url: selectedItemUrl(paper.itemKey),
+    })));
     heading.append(button('AI 全文阅读并生成', 'rw-button rw-fold-button', () => startJob('fold', { kind: 'fold', library, key: paper.itemKey }), {
       disabled: Boolean(state.job && !TERMINAL.has(state.job.status)),
       title: '需要可读取文本的 PDF；无 PDF 或扫描页会明确报错，不会生成降级摘要。',
@@ -720,8 +963,8 @@ function mountResearchWorkbench(host, { scope, call, onRead } = {}) {
     const chips = renderSelectedChips();
     if (chips) body.append(chips);
 
-    if (!scope || (!Array.isArray(scope.keys) && !scope.collection)) {
-      body.append(el(document, 'p', 'rw-empty', '先从文库选择一篇文献或一个分类，再查看标注。'));
+    if (!activeScope || (!Array.isArray(activeScope.keys) && !activeScope.collection)) {
+      body.append(el(document, 'p', 'rw-empty', '先选择一个文库分类或一篇文献，再查看标注。'));
     } else if (!state.loading && !state.papers.length && !state.readError) {
       body.append(el(document, 'p', 'rw-empty', '当前范围内没有可读取的标注文献。'));
     }

@@ -1769,9 +1769,31 @@ export function researchRequestEnvelope(name, args = {}) {
   return action === 'status' || action === 'cancel' ? { action, id: args.id } : { action, args };
 }
 
-async function callResearchTool(name, args = {}) {
+export async function callResearchToolWithApi(apiClient, name, args = {}) {
+  if (name === 'list_collections') {
+    const data = await apiClient.collections(args.library || 'user');
+    return { collections: normalizeCollections(data?.collections) };
+  }
+  if (name === 'search_library') {
+    const options = {
+      library: args.library || 'user',
+      q: args.query,
+      mode: args.mode,
+      limit: args.limit,
+      start: args.start,
+    };
+    for (const key of ['collection', 'sort', 'direction', 'tag'])
+      if (args[key] !== undefined) options[key] = args[key];
+    const data = await apiClient.items(options);
+    const items = Array.isArray(data?.items) ? data.items : [];
+    return { items, total: Number.isFinite(data?.total) ? data.total : items.length };
+  }
   const body = researchRequestEnvelope(name, args);
-  return api.requestJson('/research', { method: 'POST', body });
+  return apiClient.requestJson('/research', { method: 'POST', body });
+}
+
+async function callResearchTool(name, args = {}) {
+  return callResearchToolWithApi(api, name, args);
 }
 
 async function callCollaboration(action, args = {}) {

@@ -22,6 +22,9 @@ import { journalLevelsForItem, fetchEasyScholarRank, normalizeVenue } from './do
 import { evidenceMarkdown, scopeKeys, paperEvidence } from './domain/evidence.mjs';
 import { appendCitation, getCitation, listCitationsByItem, pruneCitations } from './domain/citation-registry.mjs';
 import { auditDocument, bindCitationFromDocument, readMarkdownDocument, MAX_MARKDOWN_DOCUMENT_BYTES } from './domain/citation-binding.mjs';
+import { openZoteroLink } from './domain/native-links.mjs';
+import { applyReaderHighlightTags, READER_HIGHLIGHT_TYPE_TAGS } from './domain/reader-highlight-tags.mjs';
+import { annotationHighlightType } from './ui/highlight-presets.js';
 
 const transactions = new ReviewTransactions(process.env.ZOTERO_WORKBENCH_STATE_DIR || join(homedir(), '.local/share/zotero-workbench/operations'));
 
@@ -39,10 +42,39 @@ const annotationTrash = new AnnotationTrash({ session, directory: transactions.d
 // Agent-proposed evidence highlights stay behind zotero-lattics review. Highlights
 // created by the reader's own selection popover carry origin='user' and save directly.
 const upstreamSaveHighlights = session.saveHighlights.bind(session);
-session.saveHighlights = async highlights => {
+let highlightSaveQueue = Promise.resolve();
+session.saveHighlights = highlights => {
   if (!(Array.isArray(highlights) && highlights.length && highlights.every(h => h?.origin === 'user')))
     throw new Error('AI 证据高亮须经 zotero-lattics 审计（review_evidence）。在阅读器中选中文本并点击“高亮并保存”，你本人的高亮可直接写入。');
-  return upstreamSaveHighlights(highlights);
+  const persist = async () => {
+    const tagged = highlights.filter(h => !h.savedAs && Array.isArray(h.tags) && h.tags.length);
+    if (!tagged.length) return upstreamSaveHighlights(highlights);
+    const writer = session.writer;
+    const originalCreate = writer.create;
+    const originalCreateDescriptor = Object.getOwnPropertyDescriptor(writer, 'create');
+    writer.create = async function(library, kind, objects, ...rest) {
+      const relevant = tagged.filter(highlight => highlight.library === library);
+      const hasTarget = kind === 'items' && Array.isArray(objects) && relevant.some(highlight => objects.some(object =>
+        object?.itemType === 'annotation' && object.parentItem === highlight.attachmentKey
+        && object.annotationText === highlight.quote
+        && (() => {
+          try { return JSON.parse(object.annotationPosition || '{}').pageIndex === highlight.pageIndex; }
+          catch { return false; }
+        })()
+      ));
+      if (!hasTarget) return originalCreate.call(this, library, kind, objects, ...rest);
+      const withTags = applyReaderHighlightTags(library, objects, relevant);
+      return originalCreate.call(this, library, kind, withTags, ...rest);
+    };
+    try { return await upstreamSaveHighlights(highlights); }
+    finally {
+      if (originalCreateDescriptor) Object.defineProperty(writer, 'create', originalCreateDescriptor);
+      else delete writer.create;
+    }
+  };
+  const operation = highlightSaveQueue.then(persist);
+  highlightSaveQueue = operation.then(() => undefined, () => undefined);
+  return operation;
 };
 // A failed annotation read must surface as an error, never a false zero count.
 session.itemDetail = async (library, key) => {
@@ -485,6 +517,8 @@ function citationSourceLine(entry) {
 register('open_workbench', 'Zotero 文献工作台', '打开真实 Zotero 文库、PDF 阅读器与 Zotero–Lattics 引用证据面板。', {}, async () => {
   await session.poll(); return { ...session.state(), workbench: { version: packageInfo.version, evidencePolicy: 'source-first; pending human adoption' } };
 }, { entrypoint: true });
+register('open_in_zotero', '在 Zotero 中打开', '仅把经过校验的 Zotero 文献选择回链，或无参数/含 page 和/或 annotation 的 PDF 回链交给操作系统打开器。成功回执只表示系统已接收请求，不证明 Zotero 已显示或定位到目标。',
+  z.object({ url: z.string().max(512) }).strict(), ({ url }) => openZoteroLink(url), { appOnly: true });
 let viewState = null;
 register('workbench_state', '阅读位置', '保存或恢复当前 MCP 实例的阅读位置，不写入 Zotero。', { state: z.record(z.string(), z.unknown()).optional() }, async ({ state }) => {
   if (state !== undefined) {
@@ -501,11 +535,12 @@ register('save_reader_highlights', '保存我的阅读高亮', '把阅读器中�
   const saved = await session.saveHighlights(targets);
   return { saved: saved.map(s => ({ id: s.id, annotationKey: s.key })), skipped: targets.length - saved.length };
 }, { readOnly: false, appOnly: true });
-register('create_reader_highlight', '高亮并保存', '把你本人在阅读器中选中的文本保存为 Zotero 高亮批注，可附备注与颜色。写入前做能力检查与指纹去重；命中已有批注时直接返回，不产生重复。', {
+register('create_reader_highlight', '高亮并保存', '把你本人在阅读器中选中的文本保存为 Zotero 高亮批注，可附备注、颜色和预设类型标签。写入前做能力检查与指纹去重；命中已有批注时返回原标签，不修改既有批注。', {
   library: librarySchema, key: keySchema, quote: z.string().min(1).max(20000),
   page: z.number().int().min(1).max(100000).optional(),
-  comment: z.string().max(20000).default(''), color: z.string().max(20).optional()
-}, async ({library, key, quote, page, comment, color}) => {
+  comment: z.string().max(20000).default(''), color: z.string().max(20).optional(),
+  tags: z.array(z.enum([...READER_HIGHLIGHT_TYPE_TAGS])).max(1).default([])
+}, async ({library, key, quote, page, comment, color, tags}) => {
   // Capability gate BEFORE any side effect (P2/P6): no candidate highlight is created on Zotero 9.
   if (session.client.status.writes === 'unsupported')
     throw new Error(`当前 Zotero ${session.client.status.version ?? ''} 的本地接口不支持写入，无法保存高亮。升级到 Zotero 10 后可在工作台直接保存；现在请先在 Zotero 中标注，工作台会同步显示。`);
@@ -515,24 +550,34 @@ register('create_reader_highlight', '高亮并保存', '把你本人在阅读器
   const existing = findExistingAnnotation(children, page, quote);
   if (existing) {
     const at = annotationPageIndex(existing.data?.annotationPosition) ?? 0;
+    const existingTags = Array.isArray(existing.data?.tags) ? existing.data.tags.map(value => typeof value === 'string' ? value : value?.tag).filter(Boolean) : [];
     return { saved: false, existing: true, annotationKey: existing.key, attachmentKey: attachment.key,
       page: at + 1, text: existing.data?.annotationText ?? '', comment: existing.data?.annotationComment ?? '',
+      tags: existingTags, type: annotationHighlightType({ tags: existingTags }), requestedTags: tags, tagsUpdated: false,
       url: annotationLink(library, attachment.key, existing.key, at) };
   }
   const { highlight } = await session.highlight(library, key, { quote, page, comment, color });
   highlight.origin = 'user';
+  highlight.tags = tags;
   try {
     await session.saveHighlights([highlight]);
     const created = highlight.savedAs ?? null;
-    let verified = false;
+    let verified = false, tagsVerified = false, storedTags = [];
     if (created) {
       const stored = await session.library.raw(library, created).catch(() => null);
+      storedTags = Array.isArray(stored?.data?.tags)
+        ? stored.data.tags.map(value => typeof value === 'string' ? value : value?.tag).filter(Boolean)
+        : [];
+      tagsVerified = JSON.stringify([...storedTags].sort()) === JSON.stringify([...tags].sort());
       verified = annotationFingerprint(stored?.data?.annotationText) === annotationFingerprint(highlight.quote)
-        && annotationPageIndex(stored?.data?.annotationPosition) === highlight.pageIndex;
+        && annotationPageIndex(stored?.data?.annotationPosition) === highlight.pageIndex
+        && tagsVerified;
     }
     return { saved: true, verified, annotationKey: created, itemKey: highlight.itemKey,
       attachmentKey: highlight.attachmentKey, page: highlight.pageIndex + 1, pageLabel: highlight.pageLabel,
-      text: highlight.quote, comment: highlight.comment,
+      text: highlight.quote, comment: highlight.comment, tags: storedTags,
+      type: annotationHighlightType({ tags: storedTags }), requestedTags: tags,
+      tagsVerified, tagsUpdated: tags.length > 0 && tagsVerified,
       url: created ? annotationLink(library, highlight.attachmentKey, created, highlight.pageIndex) : null };
   } catch (error) {
     session.clearHighlights([highlight.id]);
@@ -550,6 +595,11 @@ register('trash_reader_annotation', '移除高亮', '执行同一条批注的预
 }, args => annotationTrash.trash(args), { readOnly: false, appOnly: true, destructive: true });
 register('last_reader_annotation_trash', '上次批注移除操作', '读取本机持久操作索引，跨会话提供最近一次已核实或结果未知的批注移除操作；只返回身份与核对/恢复状态，不改 Zotero。', {},
   () => annotationTrash.latestTrash(), { appOnly: true });
+register('reader_annotation_operations', '批注移除操作列表', '分页读取本机私人操作台账中的已核实或结果未知的批注移除操作。可按文库筛选；旧记录若没有 Zotero serverId 会标为归属未知，不推测或改写归属。只读，不请求或修改 Zotero。', {
+  limit: z.number().int().min(1).max(100).default(20),
+  offset: z.number().int().min(0).default(0),
+  library: z.string().regex(/^(user|g[1-9]\d*)$/).optional()
+}, args => annotationTrash.listOperations(args), { appOnly: true });
 register('prepare_reader_annotation_restore', '预览恢复阅读高亮', '根据一条已核实的批注移除操作，确认原 key 当前标记为删除、内容摘要和版本一致，并且活动项与父 PDF 批注列表均无冲突，再生成短时恢复预览；不创建新批注。', {
   operationId: z.string().regex(/^[a-f0-9]{64}$/)
 }, args => annotationTrash.prepareRestore(args), { appOnly: true });

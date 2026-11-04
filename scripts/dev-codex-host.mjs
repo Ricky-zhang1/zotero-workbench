@@ -14,7 +14,7 @@ const READ_ONLY_TOOLS = new Set([
   'read_fulltext', 'find_in_pdf', 'cite', 'open_item', 'show_items',
   'clear_highlights', 'collect_evidence', 'research_materials', 'research_job',
   'review_operation', 'inspect_item', 'lookup_journal_levels', 'render_reading_card',
-  'library_maintenance', 'export_selection', 'citation_source_list', 'read_page_text'
+  'library_maintenance', 'export_selection', 'citation_source_list', 'read_page_text', 'reader_annotation_operations'
 ]);
 const PREPARE_TOOLS = new Set(['prepare_reader_annotation_trash', 'prepare_library_action']);
 const DENIED_TOOL_NAMES = new Set([
@@ -359,6 +359,7 @@ async function selfTest() {
   const { client, fixture, panelHtml, toolMap } = await createClientAndFixture();
   try {
     assert.equal(toolMap.get('list_collections')?.annotations?.readOnlyHint, true);
+    assert.equal(toolMap.get('reader_annotation_operations')?.annotations?.readOnlyHint, true);
     assert.equal(toolMap.get('trash_reader_annotation')?.annotations?.destructiveHint, true);
     assert.ok(panelHtml.includes('2025-11-25'), 'compiled panel should use the pinned MCP Apps protocol version');
     assert.equal(isAllowedResourceUri(PANEL_URI), true);

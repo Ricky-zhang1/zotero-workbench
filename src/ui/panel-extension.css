@@ -118,6 +118,26 @@
 .wb-comment strong{font-size:10px;font-weight:500;color:var(--z-fg3)}
 .wb-comment p{white-space:pre-wrap;margin:4px 0 0}
 .wb-annotation-actions{display:flex;gap:6px}
+.reader .wb-reader-sidebar-tools{position:sticky;top:0;z-index:2;padding:0 0 8px;background:var(--z-bg);border-bottom:1px solid var(--z-border)}
+.reader .wb-reader-batch-actions{display:flex;flex-wrap:wrap;gap:5px;padding:0 10px}
+.reader .wb-reader-batch-actions .btn{min-height:28px;padding:4px 8px;font-size:10px}
+.reader .wb-reader-selection-count{margin:6px 10px 0;color:var(--z-fg3);font-size:10px;line-height:1.5}
+.reader .wb-reader-annotation-row{display:flex;align-items:flex-start;gap:3px;padding:0 4px 0 8px}
+.reader .wb-reader-annotation-check{flex:none;margin:11px 2px 0 0;accent-color:var(--z-fg);cursor:pointer}
+.reader .wb-reader-annotation-row>.annotation{flex:1;min-width:0}
+.reader .wb-reader-trash-outcomes{display:grid;gap:6px;padding:10px;border-top:1px solid var(--z-border);font-size:10px}
+.reader .wb-reader-trash-outcomes>strong{font-size:11px;font-weight:600;color:var(--z-fg2)}
+.reader .wb-reader-trash-result{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 8px;align-items:center;padding:7px 8px;border:1px solid var(--z-border);border-radius:6px;background:var(--z-card)}
+.reader .wb-reader-trash-identity{min-width:0;overflow-wrap:anywhere;color:var(--z-fg2)}
+.reader .wb-reader-trash-status{grid-column:1;min-width:0;color:var(--z-fg3);overflow-wrap:anywhere}
+.reader .wb-reader-trash-result>.btn{grid-column:2;grid-row:1 / span 2;white-space:nowrap}
+.wb-restore-operation-picker{display:flex;align-items:center;gap:10px;margin:18px 20px 0;font-size:12px;color:var(--z-fg2)}
+.wb-restore-operation-picker select{max-width:min(280px,65vw);min-height:30px;border:1px solid var(--z-border-strong);border-radius:6px;padding:4px 8px;background:var(--z-card);color:var(--z-fg);font:inherit;font-size:11px}
+.wb-restore-list-controls{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin:16px 20px 0}
+.wb-restore-list-error,.wb-open-feedback{font-size:11px;color:var(--z-fg3);line-height:1.45}
+.wb-restore-list-error{color:#a45145}
+.wb-open-feedback{padding:2px 8px}
+.wb-open-feedback.is-error{color:#a45145}
 
 /* 布局：写作侧栏与表单 */
 .wb-writing{border-left:1px solid var(--z-border);padding-left:24px;align-self:start}

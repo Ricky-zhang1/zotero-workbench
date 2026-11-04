@@ -52,13 +52,17 @@ test('production server exposes native MCP entrypoint and full PDF resources', a
     assert.equal(tool._meta.ui.visibility.join(','),'app',name+' must stay app-only');
   }
   for (const name of [
-    'prepare_reader_annotation_trash','trash_reader_annotation','last_reader_annotation_trash',
+    'prepare_reader_annotation_trash','trash_reader_annotation','last_reader_annotation_trash','reader_annotation_operations',
     'prepare_reader_annotation_restore','restore_reader_annotation','reconcile_reader_annotation_operation'
   ]) {
     const tool = tools.find(candidate => candidate.name === name);
     assert.ok(tool, `${name} must be exposed`);
     assert.equal(tool._meta.ui.visibility.join(','), 'app', `${name} must stay app-only`);
   }
+  const operations = tools.find(candidate => candidate.name === 'reader_annotation_operations');
+  assert.equal(operations.annotations.readOnlyHint, true);
+  assert.equal(operations.annotations.destructiveHint, false);
+  assert.deepEqual(Object.keys(operations.inputSchema.properties).sort(), ['library','limit','offset']);
   const trashPreview = tools.find(candidate => candidate.name === 'prepare_reader_annotation_trash');
   assert.equal(trashPreview.annotations.readOnlyHint, true);
   assert.equal(trashPreview.annotations.destructiveHint, false);

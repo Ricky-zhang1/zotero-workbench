@@ -1,6 +1,6 @@
 {
   "name": "zotero-workbench-dsh",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "description": "DeepSeek Harness 插件：提供 Zotero 工作台、右栏阅读器与标注写作/TextFold 阅读。研究任务调用本机配置的 Codex CLI（非 DSH 原生模型），需运行仓库根目录 scripts/setup-research.py。",

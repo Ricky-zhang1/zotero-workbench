@@ -57,5 +57,7 @@ test('PDF selection has an explicit visible color independent of host theme',asy
   const css=await readFile(new URL('src/ui/panel-extension.css',root),'utf8');
   assert.match(css,/\.wb-shell \.textLayer ::selection\{background:rgba\(59,130,246,\.32\);color:transparent\}/);
   const build=await readFile(new URL('scripts/build.mjs',root),'utf8');
-  assert.match(build,/wbSaveReaderHighlight\(A\.quote\)\.then/);
+  assert.match(build,/wbReaderHighlightUi\.WorkbenchReaderHighlightControls,\{quote:A\.quote,notify:i,onSaved:\(\)=>T\(null\)\}/);
+  const controls=await readFile(new URL('src/ui/reader-highlight-controls.js',root),'utf8');
+  assert.match(controls,/wbSaveReaderHighlight\(quote, args\)/);
 });

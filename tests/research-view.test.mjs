@@ -81,6 +81,10 @@ function button(root, label) {
   return found;
 }
 
+function byClass(root, className) {
+  return all(root, node => node.className === className);
+}
+
 async function until(predicate, message = 'condition did not become true') {
   for (let attempt = 0; attempt < 100; attempt++) {
     if (predicate()) return;
@@ -248,6 +252,114 @@ test('TextFold labels all three AI-written levels and marks brief/full as source
   assert.ok(all(host, node => node.className === 'rw-origin-label').some(node => node.textContent === '原文句子'));
   button(host, '全文').click();
   assert.ok(host.textContent.includes('Exact original sentence.'));
+  dispose();
+});
+
+test('scope picker loads categories and searched literature as real material scopes', async () => {
+  const requests = [];
+  const opens = [];
+  const { host } = harness();
+  const dispose = mountResearchWorkbench(host, {
+    onRead: source => opens.push(source),
+    call: async (name, args) => {
+      requests.push({ name, args });
+      if (name === 'search_library') return {
+        total: 1, items: [{ key: 'PAPER001', title: 'Selected Paper' }],
+      };
+      if (name === 'list_collections') return {
+        library: 'user', collections: [{ key: 'COLL0001', name: '教育评价', parent: null, numItems: 3, numCollections: 0 }],
+      };
+      if (name === 'research_materials' && args.collection === 'COLL0001') return {
+        scopeId: 'collection-scope', total: 1, processed: 1, nextOffset: null,
+        papers: [paper('PAPER001', 'Selected Paper', [record({ id: 'SRC00011', itemKey: 'PAPER001', title: 'Selected Paper', text: 'Collection material.', comment: '' })])], errors: [],
+      };
+      if (name === 'research_materials' && args.keys?.[0] === 'PAPER001') return {
+        scopeId: 'paper-scope', total: 1, processed: 1, nextOffset: null,
+        papers: [paper('PAPER001', 'Selected Paper', [record({ id: 'SRC00012', itemKey: 'PAPER001', title: 'Selected Paper', text: 'Paper material.', comment: '' })])], errors: [],
+      };
+      throw new Error(`unexpected tool: ${name}`);
+    },
+  });
+
+  button(host, '个人文库 · 选择材料范围').click();
+  await until(() => byClass(host, 'rw-scope-option').length > 0);
+  button(host, '分类').click();
+  await until(() => requests.some(request => request.name === 'list_collections'));
+  await until(() => byClass(host, 'rw-scope-option').some(node => node.dataset.key === 'COLL0001'));
+  byClass(host, 'rw-scope-option').find(node => node.dataset.key === 'COLL0001').click();
+  await until(() => host.textContent.includes('Collection material.'));
+  assert.deepEqual(requests.filter(request => request.name === 'research_materials').at(-1).args.collection, 'COLL0001');
+  const selected = all(host, node => node.className === 'rw-record')[0];
+  const checkbox = all(selected, node => node.tagName === 'input')[0];
+  checkbox.checked = true;
+  checkbox.dispatch('change');
+  assert.equal(byClass(host, 'rw-chip').length, 1);
+
+  const loadedRequestsBeforeCancel = requests.filter(request => request.name === 'research_materials').length;
+  button(host, '个人文库 · 分类 教育评价').click();
+  button(host, '文献').click();
+  button(host, '取消').click();
+  assert.ok(host.textContent.includes('Collection material.'), 'cancelling the picker keeps the current scope rendered');
+  assert.equal(byClass(host, 'rw-chip').length, 1, 'cancelling the picker preserves the existing material selection');
+  assert.equal(requests.filter(request => request.name === 'research_materials').length, loadedRequestsBeforeCancel);
+
+  button(host, '个人文库 · 分类 教育评价').click();
+  button(host, '文献').click();
+  await until(() => requests.some(request => request.name === 'search_library'));
+  const search = byClass(host, 'rw-scope-search-input')[0];
+  assert.ok(search);
+  search.value = 'Selected';
+  search.dispatch('input');
+  button(host, '搜索').click();
+  await until(() => byClass(host, 'rw-scope-option').some(node => node.dataset.key === 'PAPER001'));
+  byClass(host, 'rw-scope-option').find(node => node.dataset.key === 'PAPER001').click();
+  await until(() => host.textContent.includes('Paper material.'));
+  const paperRequest = requests.filter(request => request.name === 'research_materials').at(-1);
+  assert.deepEqual(paperRequest.args.keys, ['PAPER001']);
+  assert.equal(paperRequest.args.collection, undefined);
+  assert.equal(byClass(host, 'rw-chip').length, 0, 'changing scope clears the previous material selection');
+  assert.ok(requests.some(request => request.name === 'search_library' && request.args.query === 'Selected'));
+  button(host, '打开文献').click();
+  await until(() => opens.length === 1);
+  assert.deepEqual(opens[0], {
+    library: 'user', itemKey: 'PAPER001', url: 'zotero://select/library/items/PAPER001',
+  });
+  dispose();
+});
+
+test('changing material scope ignores a delayed page from the previous scope', async () => {
+  let resolveOld;
+  const requests = [];
+  const { host } = harness();
+  const dispose = mountResearchWorkbench(host, {
+    scope: { library: 'user', keys: ['PAPER001'] },
+    call: async (name, args) => {
+      requests.push({ name, args });
+      if (name === 'research_materials' && args.keys?.[0] === 'PAPER001') {
+        return new Promise(resolve => { resolveOld = resolve; });
+      }
+      if (name === 'search_library') return { total: 1, items: [{ key: 'PAPER002', title: 'New Paper' }] };
+      if (name === 'research_materials' && args.keys?.[0] === 'PAPER002') return {
+        scopeId: 'new-scope', total: 1, processed: 1, nextOffset: null,
+        papers: [paper('PAPER002', 'New Paper', [record({ id: 'SRC00022', itemKey: 'PAPER002', title: 'New Paper', text: 'New scope result.', comment: '' })])], errors: [],
+      };
+      throw new Error(`unexpected tool: ${name}`);
+    },
+  });
+
+  await until(() => typeof resolveOld === 'function');
+  byClass(host, 'rw-scope-trigger')[0].click();
+  await until(() => byClass(host, 'rw-scope-option').some(node => node.dataset.key === 'PAPER002'));
+  byClass(host, 'rw-scope-option').find(node => node.dataset.key === 'PAPER002').click();
+  await until(() => host.textContent.includes('New scope result.'));
+  resolveOld({
+    scopeId: 'old-scope', total: 1, processed: 1, nextOffset: null,
+    papers: [paper('PAPER001', 'Old Paper', [record({ id: 'SRC00021', itemKey: 'PAPER001', title: 'Old Paper', text: 'Stale result.', comment: '' })])], errors: [],
+  });
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.ok(host.textContent.includes('New scope result.'));
+  assert.equal(host.textContent.includes('Stale result.'), false);
+  assert.deepEqual(requests.filter(request => request.name === 'research_materials').map(request => request.args.keys), [['PAPER001'], ['PAPER002']]);
   dispose();
 });
 

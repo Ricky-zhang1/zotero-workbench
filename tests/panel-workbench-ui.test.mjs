@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import vm from 'node:vm';
+import * as wbHighlightPresets from '../src/ui/highlight-presets.js';
 
 const root = new URL('../', import.meta.url);
 const [workspaceSource, extensionSource, extensionCss, buildSource, pinnedPanel] = await Promise.all([
@@ -16,6 +17,15 @@ const bridgeCalls = [];
 const messageCalls = [];
 let restoreCallError = null;
 let contextUpdateError = null;
+let prepareTrashHandler = null;
+let trashHandler = null;
+let prepareRestoreHandler = null;
+let restoreHandler = null;
+let openZoteroResult = { accepted: true, transport: 'operating-system' };
+let openZoteroError = null;
+let readerOperationsHandler = null;
+let workbenchStateError = null;
+let workbenchStatusHandler = null;
 let researchMaterialsResponse = null;
 let collaborationSessionResponse = null;
 let collaborationFeedbackResponse = null;
@@ -42,6 +52,17 @@ const en = {
   ready: async () => {},
   call: async (name, args) => {
     bridgeCalls.push({ name, args });
+    if (name === 'prepare_reader_annotation_trash' && prepareTrashHandler) return prepareTrashHandler(args);
+    if (name === 'trash_reader_annotation' && trashHandler) return trashHandler(args);
+    if (name === 'prepare_reader_annotation_restore' && prepareRestoreHandler) return prepareRestoreHandler(args);
+    if (name === 'open_in_zotero') {
+      if (openZoteroError) throw openZoteroError;
+      return openZoteroResult;
+    }
+    if (name === 'reader_annotation_operations')
+      return readerOperationsHandler ? readerOperationsHandler(args) : { operations: [], total: 0, nextOffset: null, currentServerId: 'test-server' };
+    if (name === 'workbench_state' && workbenchStateError) throw workbenchStateError;
+    if (name === 'workbench_status' && workbenchStatusHandler) return workbenchStatusHandler();
     if (name === 'research_materials') return researchMaterialsResponse;
     if (name === 'collaboration_session') {
       if (args.action === 'list') return { sessions: [] };
@@ -49,14 +70,16 @@ const en = {
     }
     if (name === 'collaboration_feedback') return collaborationFeedbackResponse;
     if (name === 'collaboration_read') return { readings: [] };
-    if (name === 'trash_reader_annotation') return { status: 'verified', action: 'moved_to_trash', operationId: 'a'.repeat(64), restoreEntryAvailable: true };
+    if (name === 'trash_reader_annotation') return { status: 'verified', action: 'moved_to_trash', operationId: 'a'.repeat(64), annotationKey: 'ANN12345', restoreEntryAvailable: true };
     if (name === 'restore_reader_annotation') {
       if (restoreCallError) throw restoreCallError;
+      if (restoreHandler) return restoreHandler(args);
       return { status: 'verified', action: 'restored_to_library', operationId: 'c'.repeat(64), annotationKey: 'ANN12345' };
     }
     if (name === 'reconcile_reader_annotation_operation') return { status: 'outcome-unknown', action: 'unresolved', operationId: args.operationId };
     return {};
   },
+  openLink: async url => { bridgeCalls.push({ name: 'openLink', args: { url } }); return { accepted: true }; },
   updateModelContext: async (...args) => { if (contextUpdateError) throw contextUpdateError; messageCalls.push({ kind: 'context', args }); },
   sendMessage: async (...args) => { messageCalls.push({ kind: 'message', args }); },
 };
@@ -67,15 +90,31 @@ const context = {
     useEffect: () => {},
   },
   en,
-  window: { matchMedia: () => ({ matches: true }), dispatchEvent: () => true },
+  wbHighlightPresets,
+  uiEvents: [],
+  window: { matchMedia: () => ({ matches: true }), dispatchEvent: event => { context.uiEvents.push(event); return true; }, addEventListener: () => {}, removeEventListener: () => {} },
   Event: class { constructor(type) { this.type = type; } },
+  CustomEvent: class { constructor(type, init = {}) { this.type = type; this.detail = init.detail; } },
+  URL,
+  navigator: { clipboard: { writeText: async text => { context.clipboardText = text; } } },
   setTimeout: fakeSetTimeout,
   clearTimeout: fakeClearTimeout,
   console,
 };
 const plain = (value) => JSON.parse(JSON.stringify(value));
+async function resetTrashState() {
+  context.uiTest.wbReaderTrashInFlight.clear();
+  context.uiTest.wbResetReaderTrashLedger();
+  readerOperationsHandler = null;
+  workbenchStateError = null;
+  await en.setWidgetState({
+    lastAnnotationTrashOperationIds: [], lastAnnotationTrashOperationId: null,
+    lastAnnotationRestoreOperationId: null, annotationRestoreOperationIds: {},
+    readerAnnotationTrashAttempts: {},
+  });
+}
 vm.createContext(context);
-vm.runInContext(`${workspaceSource}\n${extensionSource}\nglobalThis.uiTest = { wbConnectionSummary, wbRankLabels, wbRankLevels, wbRankTone, wbRankBlock, wbInspectorItem, wbAnnotationSource, wbAnnotationPrompt, wbAskAnnotation, wbAddAnnotationContext, wbRemoveAnnotationContext, wbClearAnnotationContext, wbContextSnapshot, wbContextKey, wbContextPayload, wbContextMetadata, wbSendAnnotationContextMessage, wbReadCollaborationMaterialRecords, wbCollaborationSourceSelectors, wbListCollaborationSessions, wbListCollaborationFeedback, wbLoadCollaborationSession, wbLoadCollaborationDraft, wbCollaborationDecisionLabel, wbCollaborationRangeLabel, wbCollaborationContextSources, wbCollaborationSourceStatus, wbCollaborationSourceReference, wbReplaceContextWithCollaborationSession, wbSetCollaborationContextSession, wbCollaborationFeedbackMessage, wbSendCollaborationFeedbackMessage, WorkbenchCollaboration, wbPrepareAnnotationTrash, wbConfirmAnnotationTrash, wbRememberTrashedAnnotation, wbPrepareAnnotationRestore, wbConfirmAnnotationRestore, wbReconcileAnnotationOperation, WorkbenchAnnotationRestore, wbQueueItemOpen, wbCancelItemOpen };`, context);
+vm.runInContext(`${workspaceSource}\n${extensionSource}\nglobalThis.uiTest = { wbConnectionSummary, wbStartConnectionStatusRequest, wbRankLabels, wbRankLevels, wbRankTone, wbRankBlock, wbInspectorItem, wbAnnotationSource, wbAnnotationPrompt, wbAddAnnotationContext, wbAddAnnotationContexts, wbAskAnnotation, wbRemoveAnnotationContext, wbClearAnnotationContext, wbContextSnapshot, wbContextKey, wbContextPayload, wbContextMetadata, wbSendAnnotationContextMessage, wbReadCollaborationMaterialRecords, wbCollaborationSourceSelectors, wbListCollaborationSessions, wbListCollaborationFeedback, wbLoadCollaborationSession, wbLoadCollaborationDraft, wbCollaborationDecisionLabel, wbCollaborationRangeLabel, wbCollaborationContextSources, wbCollaborationSourceStatus, wbCollaborationSourceReference, wbReplaceContextWithCollaborationSession, wbSetCollaborationContextSession, wbCollaborationFeedbackMessage, wbSendCollaborationFeedbackMessage, WorkbenchCollaboration, wbPrepareAnnotationTrash, wbConfirmAnnotationTrash, wbRememberTrashedAnnotation, wbTrackReaderTrashOperation, wbPrepareAnnotationRestore, wbConfirmAnnotationRestore, wbReconcileAnnotationOperation, wbTrashReaderAnnotationsBatch, wbRemoveReaderAnnotationOnce, wbUndoReaderAnnotationRemoval, wbReaderTrashOperationIds, wbReaderTrashAttempt, wbReaderTrashInFlight, wbSetReaderTrashLedgerOperations, wbReadReaderTrashOperations, wbResetReaderTrashLedger, wbReaderTrashLedgerOperation, wbSelectableReaderAnnotations, wbSelectedReaderAnnotations, wbSelectedReaderHighlights, wbReaderAnnotationSelectionToggle, wbReaderAnnotationSelectionForRoute, wbReaderAnnotationCopyText, wbCopyReaderAnnotations, wbReaderTrashErrorResult, wbOpenTarget, wbOpenTargetWithFeedback, WorkbenchAnnotationRestore, wbQueueItemOpen, wbCancelItemOpen };`, context);
 
 test('connection indicator follows local Zotero API and treats external Zotero MCP as optional', () => {
   const disconnectedMcp = context.uiTest.wbConnectionSummary({
@@ -135,6 +174,59 @@ test('connection indicator remains pending when workbench status is missing or u
   }
 });
 
+test('authoritative Zotero status overrides stale workbench unknown while MCP state stays optional', () => {
+  const summary=context.uiTest.wbConnectionSummary(
+    {zotero:{state:'unknown',writes:'unknown'},mcp:{connected:false},capabilities:{semanticSearch:'unavailable'}},
+    {state:'ready',writes:'available'},
+  );
+  assert.equal(summary.ready,true);
+  assert.equal(summary.button,'Zotero 已连接');
+  assert.equal(summary.highlights,'个人高亮：可直接保存（需要 Zotero 10 或更新版本）。');
+  assert.match(summary.optional,/可选 Zotero MCP 未连接/);
+  assert.match(summary.optional,/文库浏览、PDF 阅读、批注读取与引用导出仍可使用/);
+  const stopped=context.uiTest.wbConnectionSummary(
+    {zotero:{state:'ready',writes:'available'}},
+    {state:'not_running',writes:'unknown'},
+  );
+  assert.equal(stopped.ready,false,'a definitive store disconnection overrides an old ready response');
+  assert.equal(stopped.button,'Zotero 未连接');
+});
+
+test('connection status refresh discards an older response after a newer request starts', async () => {
+  workbenchStatusHandler=()=>new Promise(resolve=>statusResolvers.push(resolve));
+  const statusResolvers=[],generation={current:0},results=[],checking=[];
+  const cancelOld=context.uiTest.wbStartConnectionStatusRequest(generation,value=>results.push(value),value=>checking.push(value));
+  await new Promise(resolve=>setImmediate(resolve));
+  const cancelNew=context.uiTest.wbStartConnectionStatusRequest(generation,value=>results.push(value),value=>checking.push(value));
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(statusResolvers.length,2);
+  statusResolvers[0]({zotero:{state:'unknown'}});
+  statusResolvers[1]({zotero:{state:'ready',writes:'available'}});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.deepEqual(plain(results),[{zotero:{state:'ready',writes:'available'}}]);
+  assert.equal(checking.at(-1),false);
+  cancelOld();cancelNew();workbenchStatusHandler=null;
+  assert.match(extensionSource,/\[store\.connected,store\.state\?\.status\?\.state,store\.state\?\.status\?\.writes\]/);
+});
+
+test('Zotero links use the app-only opener and opening feedback never claims the target was displayed', async () => {
+  bridgeCalls.length = 0;
+  context.uiEvents.length = 0;
+  openZoteroResult = { accepted: true, transport: 'operating-system' };
+  const zotero = await context.uiTest.wbOpenTargetWithFeedback('zotero://open-pdf/library/items/PDF00001');
+  assert.equal(zotero.kind, 'zotero');
+  assert.ok(bridgeCalls.some(call => call.name === 'open_in_zotero' && call.args.url === 'zotero://open-pdf/library/items/PDF00001'));
+  assert.ok(!bridgeCalls.some(call => call.name === 'openLink'));
+  assert.equal(context.uiEvents.at(-1).detail.message, '已请求 Zotero 打开原文。');
+
+  const external = await context.uiTest.wbOpenTargetWithFeedback('https://example.org/source');
+  assert.equal(external.kind, 'external');
+  assert.ok(bridgeCalls.some(call => call.name === 'openLink' && call.args.url === 'https://example.org/source'));
+  assert.equal((await context.uiTest.wbOpenTarget('http://example.org/source')).kind, 'external');
+  await assert.rejects(context.uiTest.wbOpenTargetWithFeedback('file:///etc/passwd'), /仅支持 Zotero 回链或 HTTP\/HTTPS/);
+  assert.equal(context.uiEvents.at(-1).detail.status, 'error');
+});
+
 test('rank badges preserve all server levels and combine tag-only fallback without dropping dual grades', () => {
   const levels = context.uiTest.wbRankLevels({
     journalLevels: [
@@ -179,25 +271,73 @@ test('inspector joins the outer inspect_item journalLevels field to the item', (
 
 test('annotation context record retains library, item, attachment, annotation, page, quote, and comment', async () => {
   const source = context.uiTest.wbAnnotationSource(
-    { key: 'ANN12345', pageIndex: 4, text: '原文摘录', comment: '阅读者备注' },
+    { key: 'ANN12345', type: 'highlight', color: '#5fb236', tags: [{ tag: '类型:研究方法' }], pageIndex: 4, text: '原文摘录', comment: '阅读者备注' },
     { library: 'g12', itemKey: 'ITEM1234', attachmentKey: 'PDF12345' },
   );
   assert.deepEqual(plain(source), {
     library: 'g12', itemKey: 'ITEM1234', title: 'ITEM1234', attachmentKey: 'PDF12345', annotationKey: 'ANN12345',
+    annotationTypeId: 'research-method', annotationTypeLabel: '研究方法',
     pageIndex: 4, page: 5, url: 'zotero://open-pdf/groups/12/items/PDF12345?page=5&annotation=ANN12345', text: '原文摘录', comment: '阅读者备注',
   });
-  assert.match(context.uiTest.wbAnnotationPrompt(source), /PDF 附件：PDF12345[\s\S]*物理页：5[\s\S]*Zotero 回链：zotero:\/\/open-pdf\/groups\/12[\s\S]*原文摘录：[\s\S]*阅读者备注：[\s\S]*阅读者备注/);
-  await context.uiTest.wbAddAnnotationContext({ key: 'ANN12345', pageIndex: 4, text: '原文摘录', comment: '阅读者备注' }, { library: 'g12', itemKey: 'ITEM1234', attachmentKey: 'PDF12345' });
+  assert.match(context.uiTest.wbAnnotationPrompt(source), /PDF 附件：PDF12345[\s\S]*研究类型：研究方法[\s\S]*物理页：5[\s\S]*Zotero 回链：zotero:\/\/open-pdf\/groups\/12[\s\S]*原文摘录：[\s\S]*阅读者备注：[\s\S]*阅读者备注/);
+  await context.uiTest.wbAddAnnotationContext({ key: 'ANN12345', type:'highlight', tags:[{tag:'类型:研究方法'}], pageIndex: 4, text: '原文摘录', comment: '阅读者备注' }, { library: 'g12', itemKey: 'ITEM1234', attachmentKey: 'PDF12345' });
   assert.match(messageCalls.at(-1).args[0], /批注：ANN12345[\s\S]*物理页：5[\s\S]*原文摘录：[\s\S]*阅读者备注/);
   assert.equal(messageCalls.findLast(call => call.kind === 'context').args[1].zotero[0].url, source.url);
   assert.equal(messageCalls.findLast(call => call.kind === 'context').args[1].zotero[0].text, undefined);
   assert.equal(messageCalls.findLast(call => call.kind === 'context').args[1].zotero[0].comment, undefined);
+  const unclassified=context.uiTest.wbAnnotationSource({key:'ANN12346',type:'highlight',color:'#5fb236',tags:[],pageIndex:0,text:'无标签高亮'},{library:'user',itemKey:'ITEM1234',attachmentKey:'PDF12345'});
+  assert.equal(unclassified.annotationTypeLabel,'未分类','historical highlight color does not imply a research type');
+  assert.match(context.uiTest.wbReaderAnnotationCopyText([{key:'ANN12346',type:'highlight',color:'#5fb236',tags:[],pageIndex:0,text:'无标签高亮'}],{library:'user',itemKey:'ITEM1234',attachmentKey:'PDF12345'}),/研究类型：未分类/);
+  assert.match(messageCalls.findLast(call=>call.kind==='context').args[0],/研究类型：研究方法/);
   await context.uiTest.wbAskAnnotation('解释这条批注', { key: 'ANN12345', pageIndex: 4, text: '原文摘录', comment: '阅读者备注' }, { library: 'g12', itemKey: 'ITEM1234', attachmentKey: 'PDF12345' });
   assert.match(messageCalls.at(-1).args[0], /解释这条批注[\s\S]*批注：ANN12345[\s\S]*物理页：5[\s\S]*Zotero 回链：zotero:\/\/open-pdf\/groups\/12[\s\S]*原文摘录：[\s\S]*阅读者备注/);
   assert.throws(
     () => context.uiTest.wbAnnotationSource({ key: 'ANN12345', pageIndex: null }, { itemKey: 'ITEM1234', attachmentKey: 'PDF12345' }),
     /缺少条目、附件或物理页定位/,
   );
+});
+
+test('sidebar batch selection stays on the current PDF and copies full provenance without treating agent marks as Zotero annotations', async () => {
+  const rows = [
+    { kind: 'annotation', annotation: { key: 'ANN00001', type: 'highlight', pageIndex: 2, text: '摘录甲', comment: '备注甲' } },
+    { kind: 'annotation', annotation: { key: 'ANN00002', type: 'note', pageIndex: 4, text: '摘录乙', comment: '' } },
+    { kind: 'highlight', highlight: { id: 'AGENT001', pageIndex: 1, quote: '会话候选' } },
+  ];
+  const selected = context.uiTest.wbReaderAnnotationSelectionToggle(new Set(), 'ANN00001', true);
+  assert.deepEqual(plain(context.uiTest.wbSelectableReaderAnnotations(rows).map(row => row.annotation.key)), ['ANN00001', 'ANN00002']);
+  assert.deepEqual(plain(context.uiTest.wbReaderAnnotationSelectionForRoute(rows, selected, { library: 'g12', itemKey: 'ITEM1234', attachmentKey: 'PDF12345' })), ['ANN00001']);
+  assert.deepEqual(plain(context.uiTest.wbSelectedReaderHighlights(rows, selected).map(annotation => annotation.key)), ['ANN00001']);
+  assert.deepEqual([...context.uiTest.wbReaderAnnotationSelectionToggle(selected, 'ANN00001', false)], []);
+
+  const text = context.uiTest.wbReaderAnnotationCopyText([rows[0].annotation], {
+    library: 'g12', itemKey: 'ITEM1234', title: '当前文献', attachmentKey: 'PDF12345',
+  });
+  assert.match(text, /当前文献[\s\S]*g12\/ITEM1234[\s\S]*PDF12345[\s\S]*物理页：3[\s\S]*zotero:\/\/open-pdf\/groups\/12[\s\S]*摘录甲[\s\S]*备注甲/);
+  const copied = await context.uiTest.wbCopyReaderAnnotations([rows[0].annotation], { library: 'g12', itemKey: 'ITEM1234', title: '当前文献', attachmentKey: 'PDF12345' });
+  assert.equal(copied.count, 1);
+  assert.match(context.clipboardText, /物理页：3[\s\S]*摘录甲[\s\S]*备注甲/);
+  const clipboard = context.navigator.clipboard;
+  context.navigator.clipboard = null;
+  await assert.rejects(context.uiTest.wbCopyReaderAnnotations([rows[0].annotation], { library: 'g12', itemKey: 'ITEM1234', title: '当前文献', attachmentKey: 'PDF12345' }), /无法访问剪贴板/);
+  context.navigator.clipboard = clipboard;
+  assert.match(buildSource, /setReaderSelection\(new Set\(\)\).*\[t\.library,t\.itemKey,t\.attachmentKey\]/);
+  assert.match(buildSource, /type:"checkbox"[\s\S]*onClick:event=>event\.stopPropagation\(\)[\s\S]*onChange:event=>setReaderSelection/);
+  assert.match(buildSource, /移除选中高亮 \(\$\{readerSelectedHighlights\.length\}\)/);
+});
+
+test('batch context update merges selected annotations in one full replacement', async () => {
+  await context.uiTest.wbClearAnnotationContext();
+  const route = { library: 'g12', itemKey: 'ITEM1234', title: '同一篇文献', attachmentKey: 'PDF12345' };
+  await context.uiTest.wbAddAnnotationContext({ key: 'ANN00010', type: 'highlight', pageIndex: 0, text: '既有材料' }, route);
+  const before = messageCalls.filter(call => call.kind === 'context').length;
+  const result = await context.uiTest.wbAddAnnotationContexts([
+    { key: 'ANN00011', type: 'highlight', pageIndex: 1, text: '批量甲' },
+    { key: 'ANN00012', type: 'highlight', pageIndex: 2, text: '批量乙', comment: '阅读备注' },
+  ], route);
+  assert.equal(result.count, 3);
+  assert.equal(messageCalls.filter(call => call.kind === 'context').length - before, 1, 'a batch sends one cumulative complete set');
+  assert.deepEqual(plain(context.uiTest.wbContextSnapshot().map(source => source.annotationKey)), ['ANN00010', 'ANN00011', 'ANN00012']);
+  assert.match(messageCalls.at(-1).args[0], /既有材料[\s\S]*批量甲[\s\S]*批量乙[\s\S]*阅读备注/);
 });
 
 test('saved annotations accumulate in the host context and failed updates preserve the previous selection', async () => {
@@ -398,17 +538,225 @@ test('collaboration page presents selected-source count, page, quote, comment, r
 });
 
 test('annotation trash preview is not hidden by a stale startup connection state and still requires confirmation', async () => {
+  await resetTrashState();
   await context.uiTest.wbPrepareAnnotationTrash({ key: 'ANN12345', pageIndex: 4 }, { library: 'g12', itemKey: 'ITEM1234', attachmentKey: 'PDF12345' });
   assert.deepEqual(plain(bridgeCalls.at(-1)), {
     name: 'prepare_reader_annotation_trash',
     args: { library: 'g12', annotationKey: 'ANN12345', attachmentKey: 'PDF12345' },
   });
   await assert.rejects(context.uiTest.wbConfirmAnnotationTrash({ previewToken: 'a'.repeat(48), restorable: true, action: 'move_to_trash' }), /预览无效/);
-  await context.uiTest.wbConfirmAnnotationTrash({ previewToken: 'b'.repeat(48), operationId: 'c'.repeat(64), requiresConfirmation: true, restorable: true, action: 'move_to_trash' });
+  trashHandler=async()=>({status:'verified',action:'moved_to_trash',operationId:'c'.repeat(64),annotationKey:'ANN12345',restoreEntryAvailable:true});
+  await context.uiTest.wbConfirmAnnotationTrash({ previewToken: 'b'.repeat(48), operationId: 'c'.repeat(64), requiresConfirmation: true, restorable: true, action: 'move_to_trash', annotation:{key:'ANN12345',library:'g12',attachmentKey:'PDF12345'} });
+  trashHandler=null;
   assert.deepEqual(plain(bridgeCalls.at(-1)), {
     name: 'trash_reader_annotation', args: { previewToken: 'b'.repeat(48), confirmWrite: true },
   });
   assert.equal(en.widgetState.lastAnnotationTrashOperationId, 'c'.repeat(64), 'operation number is persisted before the confirmed write');
+});
+
+test('single removal is one explicit click that prepares, commits once, and keeps the original key undoable', async () => {
+  await resetTrashState();
+  const route={library:'g12',itemKey:'ITEM1234',attachmentKey:'PDF12345',title:'测试文献'};
+  const annotation={key:'ANN10001',type:'highlight',pageIndex:3,text:'原文',comment:'备注'};
+  const operationId='1'.repeat(64),previewToken='2'.repeat(48);
+  let prepareCount=0,commitCount=0,commitArgs;
+  prepareTrashHandler=async args=>{
+    prepareCount++;
+    assert.deepEqual(plain(args),{library:'g12',annotationKey:'ANN10001',attachmentKey:'PDF12345'});
+    return {status:'previewed',action:'move_to_trash',requiresConfirmation:true,restorable:true,previewToken,operationId,
+      annotation:{key:annotation.key,library:route.library,attachmentKey:route.attachmentKey}};
+  };
+  trashHandler=async args=>{
+    commitCount++;commitArgs=args;
+    return {status:'verified',action:'moved_to_trash',operationId,annotationKey:annotation.key,restoreEntryAvailable:true};
+  };
+  const result=await context.uiTest.wbRemoveReaderAnnotationOnce(annotation,route);
+  assert.equal(result.operationId,operationId);
+  assert.equal(prepareCount,1);
+  assert.equal(commitCount,1);
+  assert.deepEqual(plain(commitArgs),{previewToken,confirmWrite:true});
+  assert.deepEqual(plain(context.uiTest.wbReaderTrashOperationIds()),[operationId]);
+  assert.equal(context.uiTest.wbReaderTrashAttempt(annotation,route).status,'verified');
+  readerOperationsHandler=async()=>({operations:[{operationId,status:'verified',library:route.library,annotationKey:annotation.key,attachmentKey:route.attachmentKey,restoreEntryAvailable:true,serverMatch:'current'}],total:1,nextOffset:null,currentServerId:'test-server'});
+  await context.uiTest.wbRemoveReaderAnnotationOnce(annotation,route);
+  assert.equal(prepareCount,1,'a duplicate click uses the recorded result and does not prepare or commit again');
+  assert.equal(commitCount,1);
+  prepareTrashHandler=null;trashHandler=null;
+});
+
+test('single and batch removal share one in-flight preflight and commit per target', async () => {
+  await resetTrashState();
+  const route={library:'g12',itemKey:'ITEM1234',attachmentKey:'PDF12345'};
+  const annotation={key:'ANN10002',type:'highlight',pageIndex:2,text:'同一条'};
+  const operationId='8'.repeat(64),previewToken='9'.repeat(48);
+  let prepareCount=0,commitCount=0,releasePrepare;
+  prepareTrashHandler=async()=>{
+    prepareCount++;
+    return new Promise(resolve=>{releasePrepare=()=>resolve({status:'previewed',action:'move_to_trash',requiresConfirmation:true,restorable:true,previewToken,operationId,annotation:{key:annotation.key,library:route.library,attachmentKey:route.attachmentKey}});});
+  };
+  trashHandler=async()=>{commitCount++;return {status:'verified',action:'moved_to_trash',operationId,annotationKey:annotation.key,restoreEntryAvailable:true};};
+  const single=context.uiTest.wbRemoveReaderAnnotationOnce(annotation,route);
+  const batch=context.uiTest.wbTrashReaderAnnotationsBatch([annotation],route);
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(prepareCount,1,'the second UI surface joins the first target promise');
+  releasePrepare();
+  const [singleResult,batchResult]=await Promise.all([single,batch]);
+  assert.equal(singleResult.operationId,operationId);
+  assert.deepEqual(plain(batchResult.map(result=>result.status)),['verified']);
+  assert.equal(prepareCount,1);
+  assert.equal(commitCount,1);
+  prepareTrashHandler=null;trashHandler=null;
+});
+
+test('a failed no-write preflight can be explicitly retried on the next click', async () => {
+  await resetTrashState();
+  const route={library:'g12',itemKey:'ITEM1234',attachmentKey:'PDF12345'};
+  const annotation={key:'ANN10003',type:'highlight',pageIndex:0,text:'预检暂时失败'};
+  const operationId='a'.repeat(64),previewToken='b'.repeat(48);
+  let prepareCount=0,commitCount=0;
+  prepareTrashHandler=async()=>{
+    prepareCount++;
+    if(prepareCount===1)throw new Error('预检暂时失败；尚未提交修改。');
+    return {status:'previewed',action:'move_to_trash',requiresConfirmation:true,restorable:true,previewToken,operationId,
+      annotation:{key:annotation.key,library:route.library,attachmentKey:route.attachmentKey}};
+  };
+  trashHandler=async()=>{commitCount++;return {status:'verified',action:'moved_to_trash',operationId,annotationKey:annotation.key,restoreEntryAvailable:true};};
+  const first=await context.uiTest.wbTrashReaderAnnotationsBatch([annotation],route);
+  assert.equal(first[0].status,'failed');
+  assert.equal(first[0].blocked,false);
+  assert.equal(context.uiTest.wbReaderTrashAttempt(annotation,route),null);
+  const second=await context.uiTest.wbTrashReaderAnnotationsBatch([annotation],route);
+  assert.equal(second[0].status,'verified');
+  assert.equal(prepareCount,2);
+  assert.equal(commitCount,1);
+  prepareTrashHandler=null;trashHandler=null;
+});
+
+test('failed critical prewrite tracking stops before submitting the Zotero write', async () => {
+  await resetTrashState();
+  const route={library:'g12',itemKey:'ITEM1234',attachmentKey:'PDF12345'};
+  const annotation={key:'ANN10004',type:'highlight',pageIndex:0,text:'台账预写失败'};
+  const operationId='f'.repeat(64),previewToken='e'.repeat(48);
+  let commitCount=0;
+  prepareTrashHandler=async()=>({status:'previewed',action:'move_to_trash',requiresConfirmation:true,restorable:true,previewToken,operationId,
+    annotation:{key:annotation.key,library:route.library,attachmentKey:route.attachmentKey}});
+  trashHandler=async()=>{commitCount++;return {status:'verified',action:'moved_to_trash',operationId,annotationKey:annotation.key,restoreEntryAvailable:true};};
+  workbenchStateError=new Error('工作台操作状态暂不可保存');
+  await assert.rejects(context.uiTest.wbRemoveReaderAnnotationOnce(annotation,route),/工作台操作状态暂不可保存/);
+  assert.equal(commitCount,0,'the explicit Zotero write is not sent when critical prewrite tracking fails');
+  assert.equal(context.uiTest.wbReaderTrashAttempt(annotation,route),null);
+  workbenchStateError=null;prepareTrashHandler=null;trashHandler=null;
+});
+
+test('an unclassified transport error after submit becomes unknown and is never replayed', async () => {
+  await resetTrashState();
+  const route={library:'g12',itemKey:'ITEM1234',attachmentKey:'PDF12345'};
+  const annotation={key:'ANN10005',type:'highlight',pageIndex:1,text:'连接中断'};
+  const operationId='0'.repeat(64),previewToken='1'.repeat(48);
+  let prepareCount=0,commitCount=0;
+  prepareTrashHandler=async()=>{
+    prepareCount++;
+    return {status:'previewed',action:'move_to_trash',requiresConfirmation:true,restorable:true,previewToken,operationId,
+      annotation:{key:annotation.key,library:route.library,attachmentKey:route.attachmentKey}};
+  };
+  trashHandler=async()=>{commitCount++;throw new Error('connection reset');};
+  await assert.rejects(context.uiTest.wbRemoveReaderAnnotationOnce(annotation,route),/结果尚不确定/);
+  assert.equal(context.uiTest.wbReaderTrashAttempt(annotation,route).status,'outcome-unknown');
+  readerOperationsHandler=async()=>({operations:[{operationId,status:'outcome-unknown',library:route.library,annotationKey:annotation.key,attachmentKey:route.attachmentKey,restoreEntryAvailable:false}],total:1,nextOffset:null,currentServerId:'test-server'});
+  await assert.rejects(context.uiTest.wbRemoveReaderAnnotationOnce(annotation,route),/不会重试/);
+  assert.equal(prepareCount,1);
+  assert.equal(commitCount,1);
+  prepareTrashHandler=null;trashHandler=null;
+});
+
+test('batch removal preserves partial outcomes, blocks unknown replay, and one-click undo keeps each operation separate', async () => {
+  await resetTrashState();
+  const route={library:'g12',itemKey:'ITEM1234',attachmentKey:'PDF12345'};
+  const first={key:'ANN20001',type:'highlight',pageIndex:1,text:'第一条'};
+  const second={key:'ANN20002',type:'highlight',pageIndex:4,text:'第二条'};
+  const operationIds={ANN20001:'3'.repeat(64),ANN20002:'4'.repeat(64)};
+  const tokens={ANN20001:'5'.repeat(48),ANN20002:'6'.repeat(48)};
+  const keyByToken=new Map(Object.entries(tokens).map(([key,token])=>[token,key]));
+  let prepareCount=0,commitCount=0,restorePrepareCount=0,restoreCommitArgs;
+  prepareTrashHandler=async args=>{
+    prepareCount++;
+    const annotationKey=args.annotationKey;
+    return {status:'previewed',action:'move_to_trash',requiresConfirmation:true,restorable:true,
+      previewToken:tokens[annotationKey],operationId:operationIds[annotationKey],
+      annotation:{key:annotationKey,library:route.library,attachmentKey:route.attachmentKey}};
+  };
+  trashHandler=async args=>{
+    commitCount++;
+    const annotationKey=keyByToken.get(args.previewToken);
+    if(annotationKey==='ANN20002')throw Object.assign(new Error('操作结果尚不确定；不要重复确认。'),{code:'outcome_unknown'});
+    return {status:'verified',action:'moved_to_trash',operationId:operationIds[annotationKey],annotationKey,restoreEntryAvailable:true};
+  };
+  const firstPass=await context.uiTest.wbTrashReaderAnnotationsBatch([first,second],route);
+  assert.deepEqual(plain(firstPass.map(item=>item.status)),['verified','outcome-unknown']);
+  assert.equal(prepareCount,2);
+  assert.equal(commitCount,2);
+  assert.deepEqual(plain(context.uiTest.wbReaderTrashOperationIds()),[operationIds.ANN20001,operationIds.ANN20002]);
+  readerOperationsHandler=async()=>({operations:[
+    {operationId:operationIds.ANN20001,status:'verified',library:route.library,annotationKey:first.key,attachmentKey:route.attachmentKey,restoreEntryAvailable:true,serverMatch:'current'},
+    {operationId:operationIds.ANN20002,status:'outcome-unknown',library:route.library,annotationKey:second.key,attachmentKey:route.attachmentKey,restoreEntryAvailable:false,serverMatch:'current'},
+  ],total:2,nextOffset:null,currentServerId:'test-server'});
+  const secondPass=await context.uiTest.wbTrashReaderAnnotationsBatch([first,second],route);
+  assert.deepEqual(plain(secondPass.map(item=>item.status)),['verified','outcome-unknown']);
+  assert.equal(prepareCount,2,'persisted success and unknown outcomes are not prepared again');
+  assert.equal(commitCount,2,'unknown writes are never replayed');
+
+  prepareRestoreHandler=async args=>{
+    restorePrepareCount++;
+    assert.equal(args.operationId,operationIds.ANN20001);
+    return {status:'previewed',action:'restore_to_library',requiresConfirmation:true,sourceOperationId:args.operationId,
+      previewToken:'7'.repeat(48),restoreOperationId:'8'.repeat(64),
+      annotation:{key:first.key,library:route.library,attachmentKey:route.attachmentKey}};
+  };
+  restoreHandler=async args=>{
+    restoreCommitArgs=args;
+    return {status:'verified',action:'restored_to_library',operationId:'8'.repeat(64),annotationKey:first.key};
+  };
+  const restored=await context.uiTest.wbUndoReaderAnnotationRemoval(operationIds.ANN20001);
+  assert.equal(restored.annotationKey,first.key);
+  assert.equal(restorePrepareCount,1);
+  assert.deepEqual(plain(restoreCommitArgs),{previewToken:'7'.repeat(48),confirmWrite:true});
+  assert.deepEqual(plain(context.uiTest.wbReaderTrashOperationIds()),[operationIds.ANN20002],'undo removes only the matching original operation');
+  assert.equal(context.uiTest.wbReaderTrashAttempt(first,route),null);
+  assert.equal(context.uiTest.wbReaderTrashAttempt(second,route).status,'outcome-unknown');
+  assert.equal(bridgeCalls.filter(call=>call.name==='trash_reader_annotation').length>0,true);
+  prepareTrashHandler=null;trashHandler=null;prepareRestoreHandler=null;restoreHandler=null;
+});
+
+test('persistent recovery list paginates the backend ledger and supersedes stale widget cache', async () => {
+  await resetTrashState();
+  const first={operationId:'c'.repeat(64),status:'verified',library:'g12',annotationKey:'ANN30001',attachmentKey:'PDF30001',restoreEntryAvailable:true,serverMatch:'current'};
+  const second={operationId:'d'.repeat(64),status:'outcome-unknown',library:'user',annotationKey:'ANN30002',attachmentKey:'PDF30002',restoreEntryAvailable:false,serverMatch:'unknown'};
+  const offsets=[];
+  readerOperationsHandler=async args=>{
+    offsets.push(args.offset);
+    return args.offset===0?{operations:[first],total:2,nextOffset:1,currentServerId:'test-server'}:
+      {operations:[second],total:2,nextOffset:null,currentServerId:'test-server'};
+  };
+  await en.setWidgetState({lastAnnotationTrashOperationIds:['e'.repeat(64)],lastAnnotationTrashOperationId:'e'.repeat(64)});
+  const operations=await context.uiTest.wbReadReaderTrashOperations();
+  assert.deepEqual(offsets,[0,1]);
+  assert.deepEqual(plain(operations.map(operation=>operation.operationId)),[first.operationId,second.operationId]);
+  assert.deepEqual(plain(context.uiTest.wbReaderTrashOperationIds()),[first.operationId,second.operationId]);
+  assert.equal(context.uiTest.wbReaderTrashLedgerOperation(second.operationId).serverMatch,'unknown');
+  readerOperationsHandler=null;
+});
+
+test('full backend recovery history can exceed the bounded widget cache without blocking new entries', async () => {
+  await resetTrashState();
+  const operations=Array.from({length:260},(_,index)=>({
+    operationId:String(index+1).padStart(64,'0'),status:'verified',library:'user',annotationKey:'ANN00001',attachmentKey:'PDF00001',restoreEntryAvailable:true,
+  }));
+  context.uiTest.wbSetReaderTrashLedgerOperations(operations);
+  const newOperation='a'.repeat(64);
+  await context.uiTest.wbTrackReaderTrashOperation(newOperation);
+  assert.equal(context.uiTest.wbReaderTrashOperationIds().length,261,'the backend index remains complete beyond the widget cache cap');
+  assert.equal(en.widgetState.lastAnnotationTrashOperationIds.length,256,'widget state is a bounded convenience cache');
+  assert.equal(en.widgetState.lastAnnotationTrashOperationId,newOperation);
 });
 
 test('reconcile sends only the operation number to the read-only ledger verifier', async () => {
@@ -419,7 +767,9 @@ test('reconcile sends only the operation number to the read-only ledger verifier
   });
 });
 
-test('verified trash keeps a persistent review key and restore confirmation targets the exact original annotation', async () => {
+test('verified trash keeps a persistent review key and restoration targets the exact original annotation', async () => {
+  await resetTrashState();
+  await resetTrashState();
   await context.uiTest.wbRememberTrashedAnnotation({ operationId: 'a'.repeat(64), restoreEntryAvailable: true });
   assert.equal(en.widgetState.lastAnnotationTrashOperationId, 'a'.repeat(64));
   const preview = {
@@ -450,9 +800,11 @@ test('restore panel treats an unknown result as review-only and the native build
   assert.ok(extensionSource.includes("restore_reader_annotation"));
   assert.ok(extensionSource.includes('restoreCompletion'), 'verified restore remains visible after the recovery entry is removed');
   assert.ok(extensionSource.includes('返回文库与阅读'));
-  assert.ok(buildSource.includes('wbRememberTrashedAnnotation(result)'));
-  assert.ok(buildSource.includes('恢复只有在精确回读确认后才算完成'));
+  assert.ok(extensionSource.includes('wbRememberTrashedAnnotation(result)'));
+  assert.ok(extensionSource.includes('按原 key 回读核实'));
+  assert.ok(extensionSource.includes('wbReaderTrashOperationIds'));
   assert.ok(extensionCss.includes('.wb-restore-panel'));
+  assert.ok(extensionCss.includes('.wb-restore-operation-picker'));
 });
 
 test('workbench_state merges library collapse preference with the navigation stack', async () => {
@@ -485,14 +837,18 @@ test('native panel build wires main-row double-click and popover actions at pinn
   assert.ok(buildSource.includes('if(wbShouldInspect())a([p.key]);else wbQueueItemOpen'));
   assert.ok(buildSource.includes('wbAskAnnotation(question,t.annotation,i)'));
   assert.ok(buildSource.includes('wbAddAnnotationContext(t.annotation,i)'));
-  assert.ok(buildSource.includes('wbPrepareAnnotationTrash(t.annotation,i)'));
-  assert.ok(buildSource.includes('wbConfirmAnnotationTrash(trashPreview)'));
-  assert.ok(buildSource.includes('children:"移除高亮…"'));
-  assert.ok(buildSource.includes(':"确认移除高亮"'));
-  assert.ok(buildSource.includes('Zotero 顶层回收站'));
+  assert.ok(buildSource.includes('wbRemoveReaderAnnotationOnce(t.annotation,i)'));
+  assert.ok(buildSource.includes('children:"移除高亮"'));
+  assert.ok(buildSource.includes('wbTrashReaderAnnotationsBatch(candidates,readerRoute)'));
+  assert.ok(buildSource.includes('wbUndoReaderAnnotationRemoval(outcome.operationId)'));
+  assert.ok(buildSource.includes('wbCopyReaderAnnotations(readerSelected,readerRoute)'));
+  assert.ok(buildSource.includes('wbAddAnnotationContexts(readerSelected,readerRoute)'));
+  assert.ok(buildSource.includes('replaceBetweenOnce(panel,'));
+  assert.ok(buildSource.includes('workbench-reader-trash-result'));
+  assert.ok(extensionSource.includes('Zotero 顶层回收站'));
   assert.ok(!buildSource.includes('wbCanAttemptAnnotationTrash'));
   assert.ok(buildSource.includes('wbRankBlock(c,"wb-detail-ranks")'));
-  assert.ok(buildSource.includes('可按原 key 单独恢复，并须通过回读确认'));
+  assert.ok(extensionSource.includes('恢复只针对原批注 key'));
 });
 
 test('saved annotation popover uses system typography, constrained width, and a collapsible body', () => {

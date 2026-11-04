@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -93,6 +94,29 @@ async function fixture(t, {
 
 async function preview(f) {
   return f.trash.prepare({ library: LIBRARY, annotationKey: ANNOTATION, attachmentKey: ATTACHMENT });
+}
+
+function restoreOperationId(source) {
+  return createHash('sha256').update(JSON.stringify({
+    kind: 'reader-annotation-restore', sourceOperationId: source.operationId, library: source.library,
+    annotationKey: source.annotationKey, attachmentKey: source.attachmentKey,
+    postTrashVersion: source.postTrashVersion, attachmentVersion: source.attachmentVersion
+  })).digest('hex');
+}
+
+function trashRecord(operationId, overrides = {}) {
+  return {
+    kind: 'reader-annotation-trash', operationId, status: 'verified',
+    library: LIBRARY, annotationKey: ANNOTATION, attachmentKey: ATTACHMENT,
+    annotationVersion: 11, attachmentVersion: 7, postTrashVersion: 12,
+    restorationStatus: 'unverified', submittedAt: 1,
+    annotationSnapshotHash: 'f'.repeat(64),
+    ...overrides
+  };
+}
+
+async function persistJournal(directory, record) {
+  await writeFile(join(directory, `${record.operationId}.json`), JSON.stringify(record));
 }
 
 test('preview names exactly one highlight with PDF provenance and writes nothing', async t => {
@@ -546,4 +570,58 @@ test('latest verified deletion pointer and restore journal survive a new service
   assert.equal(review.kind, 'reader-annotation-restore');
   assert.equal(review.sourceOperationId, deletion.operationId);
   assert.equal(review.status, 'verified');
+});
+
+test('operation index survives a new service instance, paginates every unresolved id, and excludes verified restores', async t => {
+  const f = await fixture(t);
+  f.session.client.status.serverId = 'server-current';
+  const unbound = trashRecord('1'.repeat(64), { submittedAt: 30 });
+  const explicitlyRestored = trashRecord('2'.repeat(64), {
+    submittedAt: 40, restoredByOperationId: 'a'.repeat(64)
+  });
+  const unknown = trashRecord('3'.repeat(64), {
+    status: 'outcome-unknown', submittedAt: 20, library: 'g8',
+    serverId: 'server-older', errorCode: 'write_outcome_unknown'
+  });
+  const restoreCommitted = trashRecord('4'.repeat(64), { submittedAt: 50 });
+  const restoreUncertain = trashRecord('5'.repeat(64), { submittedAt: 10 });
+  const rejected = trashRecord('6'.repeat(64), { status: 'rejected', submittedAt: 60 });
+  const unknownRestoreId = restoreOperationId(restoreUncertain);
+  for (const record of [unbound, explicitlyRestored, unknown, restoreCommitted, restoreUncertain, rejected])
+    await persistJournal(f.directory, record);
+  await persistJournal(f.directory, {
+    kind: 'reader-annotation-restore', operationId: 'b'.repeat(64), status: 'verified',
+    sourceOperationId: restoreCommitted.operationId
+  });
+  await persistJournal(f.directory, {
+    kind: 'reader-annotation-restore', operationId: unknownRestoreId, status: 'outcome-unknown',
+    sourceOperationId: restoreUncertain.operationId
+  });
+
+  const restarted = new AnnotationTrash({ session: f.session, directory: f.directory });
+  const firstPage = await restarted.listOperations({ limit: 2, offset: 0 });
+  assert.equal(firstPage.total, 3);
+  assert.equal(firstPage.offset, 0);
+  assert.equal(firstPage.limit, 2);
+  assert.equal(firstPage.nextOffset, 2);
+  assert.equal(firstPage.currentServerId, 'server-current');
+  assert.deepEqual(firstPage.operations.map(operation => operation.operationId), [unbound.operationId, unknown.operationId]);
+  assert.equal(firstPage.operations[0].serverId, null);
+  assert.equal(firstPage.operations[0].serverMatch, 'unknown', 'missing historical serverId remains unknown');
+  assert.equal(firstPage.operations[1].serverMatch, 'different');
+  assert.equal(Object.hasOwn(firstPage.operations[0], 'annotationSnapshotHash'), false);
+  assert.equal(Object.hasOwn(firstPage.operations[0], 'annotationText'), false);
+
+  const lastPage = await restarted.listOperations({ limit: 2, offset: firstPage.nextOffset });
+  assert.deepEqual(lastPage.operations.map(operation => operation.operationId), [restoreUncertain.operationId]);
+  assert.equal(lastPage.nextOffset, null);
+  assert.equal(lastPage.operations[0].restoreOperationId, unknownRestoreId);
+  assert.equal(lastPage.operations[0].restoreStatus, 'outcome-unknown');
+  assert.equal(lastPage.operations[0].status, 'verified', 'uncertain restore does not erase the source operation');
+
+  const onlyUserLibrary = await restarted.listOperations({ library: LIBRARY });
+  assert.deepEqual(onlyUserLibrary.operations.map(operation => operation.operationId), [unbound.operationId, restoreUncertain.operationId]);
+  assert.deepEqual(JSON.parse(await readFile(join(f.directory, `${unbound.operationId}.json`), 'utf8')), unbound,
+    'listing does not bind or rewrite a historical record without serverId');
+  assert.equal(f.writes.length, 0, 'index reads do not write to Zotero');
 });

@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { constants } from 'node:fs';
-import { chmod, mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
+import { chmod, mkdir, open, readFile, readdir, rename, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { libraryPrefix } from '../../dist/runtime.mjs';
@@ -754,30 +754,96 @@ export class AnnotationTrash {
   }
 
   async latestTrash() {
-    let pointer;
-    try { pointer = JSON.parse(await readFile(join(this.directory, LATEST_TRASH_PATH), 'utf8')); }
-    catch (error) {
-      if (error?.code === 'ENOENT') return null;
-      throw new AnnotationTrashError('journal_unavailable', '无法读取最近一次批注移除操作索引。');
+    const { operations } = await this.listOperations({ limit: 1 });
+    return operations[0] ?? null;
+  }
+
+  async listOperations({ limit = 20, offset = 0, library } = {}) {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100 ||
+        !Number.isSafeInteger(offset) || offset < 0)
+      throw new AnnotationTrashError('invalid_input', '操作列表分页参数无效。');
+    if (library !== undefined) requireLibrary(library);
+
+    let entries;
+    try {
+      entries = await readdir(this.directory, { withFileTypes: true });
+    } catch (error) {
+      if (error?.code === 'ENOENT') entries = [];
+      else throw new AnnotationTrashError('journal_unavailable', '无法读取本地批注操作索引。');
     }
-    if (pointer?.kind !== 'reader-annotation-trash-latest' || !/^[a-f0-9]{64}$/.test(String(pointer.operationId || ''))) return null;
-    const operation = await this.status(pointer.operationId);
-    if (operation?.kind !== JOURNAL_KIND || !['verified', 'outcome-unknown'].includes(operation.status)) return null;
-    if (operation.restoredByOperationId) return null;
-    const restoreOperationId = Number.isSafeInteger(operation.postTrashVersion) ? this.#restoreOperationId(operation) : null;
-    let restoreStatus = null;
-    if (restoreOperationId) {
-      const restore = await this.status(restoreOperationId);
-      if (restore?.status === 'verified') return null;
-      restoreStatus = restore?.status ?? null;
+
+    const records = [];
+    for (const entry of entries) {
+      const match = /^(?<operationId>[a-f0-9]{64})\.json$/.exec(entry.name);
+      if (!match || !entry.isFile()) continue;
+      let record;
+      let handle;
+      try {
+        handle = await open(join(this.directory, entry.name), constants.O_RDONLY | constants.O_NOFOLLOW);
+        record = JSON.parse(await handle.readFile('utf8'));
+      } catch {
+        throw new AnnotationTrashError('journal_unavailable', '本地批注操作索引中有记录无法安全读取；未返回不完整列表。', match.groups.operationId);
+      } finally {
+        await handle?.close().catch(() => {});
+      }
+      if (!isRecord(record) || record.operationId !== match.groups.operationId ||
+          ![JOURNAL_KIND, RESTORE_KIND].includes(record.kind)) continue;
+      records.push(record);
     }
+
+    const verifiedRestoreSources = new Set(records
+      .filter(record => record.kind === RESTORE_KIND && record.status === 'verified' &&
+        /^[a-f0-9]{64}$/.test(String(record.sourceOperationId ?? '')))
+      .map(record => record.sourceOperationId));
+    const currentServerId = typeof this.session.client?.status?.serverId === 'string'
+      ? this.session.client.status.serverId : null;
+    const operations = records.filter(record => {
+      if (record.kind !== JOURNAL_KIND || !['verified', 'outcome-unknown'].includes(record.status)) return false;
+      if (!/^[A-Z0-9]{8}$/.test(String(record.annotationKey ?? '')) ||
+          !/^[A-Z0-9]{8}$/.test(String(record.attachmentKey ?? ''))) return false;
+      try { libraryId(record.library); } catch { return false; }
+      if (library !== undefined && record.library !== library) return false;
+      return !record.restoredByOperationId && !verifiedRestoreSources.has(record.operationId);
+    }).sort((left, right) => {
+      const time = record => {
+        for (const value of [record.verifiedAt, record.submittedAt, record.finishedAt, record.createdAt, record.updatedAt]) {
+          if (Number.isFinite(value)) return value;
+          if (typeof value === 'string' && Number.isFinite(Date.parse(value))) return Date.parse(value);
+        }
+        return 0;
+      };
+      return time(right) - time(left) || right.operationId.localeCompare(left.operationId);
+    });
+
+    const total = operations.length;
+    const page = operations.slice(offset, offset + limit).map(operation => {
+      const restoreOperationId = Number.isSafeInteger(operation.postTrashVersion)
+        ? this.#restoreOperationId(operation) : null;
+      const restore = restoreOperationId ? records.find(record =>
+        record.kind === RESTORE_KIND && record.operationId === restoreOperationId) : null;
+      const recordedServerId = typeof operation.serverId === 'string' ? operation.serverId : null;
+      return {
+        status: operation.status,
+        operationId: operation.operationId,
+        library: operation.library,
+        annotationKey: operation.annotationKey,
+        attachmentKey: operation.attachmentKey,
+        annotationVersion: Number.isSafeInteger(operation.annotationVersion) ? operation.annotationVersion : null,
+        attachmentVersion: Number.isSafeInteger(operation.attachmentVersion) ? operation.attachmentVersion : null,
+        submittedAt: operation.submittedAt ?? null,
+        restorationStatus: operation.restorationStatus ?? (operation.status === 'outcome-unknown' ? 'unverified' : 'unavailable'),
+        restoreEntryAvailable: operation.status === 'verified' && operation.restorationStatus === 'unverified' && Number.isSafeInteger(operation.postTrashVersion),
+        reconcileAvailable: operation.status === 'outcome-unknown',
+        restoreOperationId,
+        restoreStatus: restore?.status ?? null,
+        serverId: recordedServerId,
+        serverMatch: !recordedServerId || !currentServerId ? 'unknown' : recordedServerId === currentServerId ? 'current' : 'different'
+      };
+    });
     return {
-      status: operation.status, operationId: operation.operationId,
-      library: operation.library, annotationKey: operation.annotationKey, attachmentKey: operation.attachmentKey,
-      restoreEntryAvailable: operation.status === 'verified' && operation.restorationStatus === 'unverified' && Number.isSafeInteger(operation.postTrashVersion),
-      reconcileAvailable: operation.status === 'outcome-unknown',
-      restoreOperationId, restoreStatus,
-      restorationStatus: operation.restorationStatus ?? (operation.status === 'outcome-unknown' ? 'unverified' : 'unavailable')
+      operations: page, total, offset, limit,
+      nextOffset: offset + page.length < total ? offset + page.length : null,
+      currentServerId
     };
   }
 

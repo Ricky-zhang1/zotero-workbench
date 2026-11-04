@@ -333,7 +333,7 @@ def validate_no_private_paths(files: dict[str, tuple[bytes, int]], home: Path | 
         # Homebrew's /opt/homebrew is a generic upstream runtime search path,
         # not a user-specific location. Reject this machine's actual home and
         # other known private roots instead.
-        b"/Users/example/", b"/Volumes/ExampleDrive/",
+        b"/Users/example/", b"/Volumes/Ruizhe_space/",
     ]
     if home is not None:
         home_text = str(home).rstrip("/").encode("utf-8")
