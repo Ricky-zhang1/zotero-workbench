@@ -166,6 +166,52 @@ test('omitted deleted field permits preview only with matching parent-PDF eviden
   assert.ok(f.readbacks.some(path => path.includes('/children?itemType=annotation')));
 });
 
+test('Zotero active-item and PDF-child responses may both omit deleted when exact rows agree', async t => {
+  const f = await fixture(t);
+  delete f.items.get(ANNOTATION).data.deleted;
+  const responseRows = new Map();
+  const getJson = f.session.client.getJson;
+  f.session.client.getJson = async path => {
+    const result = await getJson(path);
+    if (path.endsWith(`/items/${ANNOTATION}`)) responseRows.set('exact', result.data);
+    if (path.endsWith(`/items?itemType=annotation&itemKey=${ANNOTATION}`)) responseRows.set('active', result.data);
+    if (path.endsWith(`/items/${ATTACHMENT}/children?itemType=annotation`)) responseRows.set('children', result.data);
+    return result;
+  };
+
+  const result = await preview(f);
+  assert.equal(result.status, 'previewed');
+  assert.ok(f.readbacks.some(path => path.endsWith(`/items?itemType=annotation&itemKey=${ANNOTATION}`)));
+  assert.ok(f.readbacks.some(path => path.endsWith(`/items/${ATTACHMENT}/children?itemType=annotation`)));
+  const exact = responseRows.get('exact');
+  assert.equal(Object.hasOwn(exact.data, 'deleted'), false);
+  for (const label of ['active', 'children']) {
+    const rows = responseRows.get(label);
+    const [matching] = rows.filter(row => row.key === ANNOTATION);
+    assert.equal(rows.filter(row => row.key === ANNOTATION).length, 1);
+    assert.equal(Object.hasOwn(matching.data, 'deleted'), false);
+    assert.equal(matching.version, exact.version);
+    assert.deepEqual(matching.data, exact.data);
+  }
+  assert.equal(f.writes.length, 0);
+});
+
+test('explicit boolean and integer deleted values keep their meaning', async t => {
+  for (const value of [false, 0, '0']) {
+    const f = await fixture(t);
+    f.items.get(ANNOTATION).data.deleted = value;
+    assert.equal((await preview(f)).status, 'previewed', `deleted=${String(value)} is explicitly active`);
+    assert.equal(f.writes.length, 0);
+  }
+
+  for (const value of [true, 1, '1']) {
+    const f = await fixture(t);
+    f.items.get(ANNOTATION).data.deleted = value;
+    await assert.rejects(preview(f), error => error.code === 'deleted_state_unavailable');
+    assert.equal(f.writes.length, 0);
+  }
+});
+
 test('missing deleted field alone, conflicting content, and conflicting versions never authorize removal', async t => {
   for (const conflict of ['missing', 'text', 'version', 'deleted']) {
     const f = await fixture(t);
