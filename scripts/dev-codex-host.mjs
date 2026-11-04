@@ -5,9 +5,12 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { StdioClient } from '../tests/mcp-client.mjs';
 import {
+  createAnnotationTestGate,
   createResearchTestGate,
+  parseAnnotationTestOptions,
   parseFixtureTheme,
   parseResearchTestOptions,
+  prepareAnnotationTestStateDir,
   prepareResearchTestStateDir,
   RESEARCH_TEST_ITEM,
 } from './dev-codex-host-policy.mjs';
@@ -26,6 +29,7 @@ const READ_ONLY_TOOLS = new Set([
 const PREPARE_TOOLS = new Set(['prepare_reader_annotation_trash', 'prepare_library_action']);
 const DENIED_TOOL_NAMES = new Set([
   'start_research_job', 'cancel_research_job', 'trash_reader_annotation',
+  'read_reader_annotation_comment', 'update_reader_annotation_comment',
   'commit_library_action', 'save_reader_highlights', 'create_reader_highlight',
   'highlight', 'save_highlights', 'add_item', 'attach_pdf',
   'update_item', 'add_note', 'create_collection', 'authorize_writes', 'review_evidence',
@@ -35,7 +39,10 @@ const MAX_RPC_BYTES = 2 * 1024 * 1024;
 const MAX_LOG_ENTRIES = 120;
 const MAX_LOG_TEXT = 1400;
 const researchTestPolicy = parseResearchTestOptions(process.argv.slice(2));
+const annotationTestPolicy = parseAnnotationTestOptions(process.argv.slice(2));
 const fixtureTheme = parseFixtureTheme(process.argv.slice(2));
+if (researchTestPolicy && annotationTestPolicy)
+  throw new Error('研究任务 fixture 与批注备注 fixture 必须使用各自独立的私有状态目录，不能同时启用。');
 
 class RpcError extends Error {
   constructor(code, message) { super(message); this.code = code; }
@@ -75,6 +82,7 @@ function createFixture({ client, toolMap, panelHtml, initialMode = 'fullscreen',
     initialized: false,
   };
   const researchGate = createResearchTestGate(researchTestPolicy);
+  const annotationCommentGate = createAnnotationTestGate(annotationTestPolicy);
   const record = (kind, message) => {
     logs.push({ at: new Date().toLocaleTimeString('zh-CN', { hour12: false }), kind, message: boundedText(message) });
     if (logs.length > MAX_LOG_ENTRIES) logs.splice(0, logs.length - MAX_LOG_ENTRIES);
@@ -92,6 +100,17 @@ function createFixture({ client, toolMap, panelHtml, initialMode = 'fullscreen',
       try { researchGate.assertCancel(args); }
       catch (error) { throw new RpcError(-32001, error.message); }
       return { tool, prepare: false, researchAction: 'cancel' };
+    }
+    if (name === 'read_reader_annotation_comment' || name === 'update_reader_annotation_comment') {
+      try {
+        if (name === 'read_reader_annotation_comment') annotationCommentGate.assertRead(args);
+        else annotationCommentGate.assertUpdate(args);
+      } catch (error) { throw new RpcError(-32001, error.message); }
+      if (tool.annotations?.destructiveHint === true ||
+          (name === 'read_reader_annotation_comment' && tool.annotations?.readOnlyHint !== true) ||
+          (name === 'update_reader_annotation_comment' && tool.annotations?.readOnlyHint !== false))
+        throw new RpcError(-32001, `Fixture 批注备注工具注解不符合预期：${name}`);
+      return { tool, prepare: false, annotationCommentAction: name === 'read_reader_annotation_comment' ? 'read' : 'update' };
     }
     if (DENIED_TOOL_NAMES.has(name)) throw new RpcError(-32001, `Fixture 安全策略已阻止工具：${name}`);
     const prepare = PREPARE_TOOLS.has(name);
@@ -155,8 +174,11 @@ function createFixture({ client, toolMap, panelHtml, initialMode = 'fullscreen',
         if (!state.initialized) throw new RpcError(-32002, '请先完成 ui/initialize 握手。');
         const name = params.name;
         const args = params.arguments && typeof params.arguments === 'object' && !Array.isArray(params.arguments) ? params.arguments : {};
-        const { prepare, researchAction } = assertToolAllowed(name, args);
-        record(prepare ? 'Prepare 预览' : researchAction ? '显式研究测试' : '工具读取', `${name} · 参数字段：${Object.keys(args).join(', ') || '无'}`);
+        const { prepare, researchAction, annotationCommentAction } = assertToolAllowed(name, args);
+        if (annotationCommentAction)
+          record('批注备注验收', `${name} · ${args.library}/${args.annotationKey} · ${args.attachmentKey} · 参数不含备注正文与 editToken`);
+        else
+          record(prepare ? 'Prepare 预览' : researchAction ? '显式研究测试' : '工具读取', `${name} · 参数字段：${Object.keys(args).join(', ') || '无'}`);
         const result = await client.call(name, args);
         const structured = result?.structuredContent;
         if (researchAction === 'start') {
@@ -210,9 +232,11 @@ function createFixture({ client, toolMap, panelHtml, initialMode = 'fullscreen',
     }
   }
 
-  const safetyLabel = researchTestPolicy
-    ? `显式研究测试仅开放 ${researchTestPolicy.itemKey} 的 fold/translate/translate_annotations`
-    : 'Zotero 写入与 AI 任务已拦截';
+  const safetyLabel = annotationTestPolicy
+    ? '显式批注备注验收仅开放指定个人批注的备注读写；其他写入与 AI 任务已拦截'
+    : researchTestPolicy
+      ? `显式研究测试仅开放 ${researchTestPolicy.itemKey} 的 fold/translate/translate_annotations`
+      : 'Zotero 写入与 AI 任务已拦截';
   const wrapperHtml = `<!doctype html>
 <html lang="zh-CN" data-mode="${state.mode}" data-theme="${state.theme}">
 <head>
@@ -374,7 +398,9 @@ function createFixture({ client, toolMap, panelHtml, initialMode = 'fullscreen',
 
 async function createClientAndFixture() {
   await prepareResearchTestStateDir(researchTestPolicy);
-  const clientEnv = researchTestPolicy ? { ZOTERO_WORKBENCH_STATE_DIR: researchTestPolicy.stateDir } : {};
+  await prepareAnnotationTestStateDir(annotationTestPolicy);
+  const fixtureStateDir = annotationTestPolicy?.stateDir ?? researchTestPolicy?.stateDir;
+  const clientEnv = fixtureStateDir ? { ZOTERO_WORKBENCH_STATE_DIR: fixtureStateDir } : {};
   const client = new StdioClient(clientEnv);
   try {
     await client.ready();
@@ -419,6 +445,10 @@ async function selfTest() {
     assert.throws(() => fixture.assertToolAllowed('cancel_research_job', { id: 'a'.repeat(24) }), /只允许取消|安全策略/);
     if (toolMap.has('open_in_zotero'))
       assert.throws(() => fixture.assertToolAllowed('open_in_zotero', { url: `zotero://select/library/items/${RESEARCH_TEST_ITEM}` }), /安全策略|白名单/);
+    for (const name of ['read_reader_annotation_comment', 'update_reader_annotation_comment']) {
+      if (toolMap.has(name))
+        assert.throws(() => fixture.assertToolAllowed(name, {}), /默认阻止|严格符合 fixture 身份|未知工具/);
+    }
     if (researchTestPolicy) {
       for (const kind of ['fold', 'translate'])
         assert.equal(fixture.assertToolAllowed('start_research_job', { kind, library: 'user', key: researchTestPolicy.itemKey }).researchAction, 'start');
@@ -486,8 +516,8 @@ function assertToolPreparePolicy(toolMap) {
 const portArgIndex = process.argv.indexOf('--port');
 const requestedPort = portArgIndex >= 0 ? Number(process.argv[portArgIndex + 1]) : Number(process.env.ZOTERO_DEV_HOST_PORT ?? 4173);
 if (process.argv.includes('--self-test')) {
-  if (researchTestPolicy)
-    throw new Error('--self-test 始终验证默认 AI 全封锁，请移除研究测试 opt-in 参数后重试。');
+  if (researchTestPolicy || annotationTestPolicy)
+    throw new Error('--self-test 始终验证默认权限全封锁，请移除研究或批注备注 opt-in 参数后重试。');
   await selfTest();
 } else {
   if (!Number.isInteger(requestedPort) || requestedPort < 0 || requestedPort > 65535)
@@ -496,9 +526,11 @@ if (process.argv.includes('--self-test')) {
   try {
     const address = await fixture.listen(requestedPort);
     console.log(`Codex native panel fixture ready at http://127.0.0.1:${address.port}`);
-    console.log(researchTestPolicy
-      ? `本机验收专用（非正式 Codex 宿主）：仅显式启用 ${researchTestPolicy.itemKey} 的 fold/translate/translate_annotations；Zotero 写入、draft、其他文献任务和外部对话发送均被阻止。`
-      : '本机验收专用：只读工具 + prepare 预览；Zotero 写入、AI 任务和外部对话发送均被阻止。');
+    console.log(annotationTestPolicy
+      ? `本机验收专用（非正式 Codex 宿主）：仅允许显式身份 ${annotationTestPolicy.annotationKey}/${annotationTestPolicy.attachmentKey} 的批注备注读取与受保护更新；其他 Zotero 写入、AI 任务和外部对话发送均被阻止。`
+      : researchTestPolicy
+        ? `本机验收专用（非正式 Codex 宿主）：仅显式启用 ${researchTestPolicy.itemKey} 的 fold/translate/translate_annotations；Zotero 写入、draft、其他文献任务和外部对话发送均被阻止。`
+        : '本机验收专用：只读工具 + prepare 预览；Zotero 写入、AI 任务和外部对话发送均被阻止。');
     console.log('Use Ctrl+C to stop.');
     const shutdown = async () => {
       await fixture.close();

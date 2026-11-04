@@ -3,6 +3,8 @@ import { chmod, lstat, mkdir } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 export const RESEARCH_TEST_ITEM = 'TEST0001';
+export const ANNOTATION_TEST_KEY = 'TEST0001';
+export const ANNOTATION_TEST_ATTACHMENT = 'PDFTEST1';
 const PRIVATE_STATE_ROOT = resolve(homedir(), '.local/share/zotero-workbench');
 const ZOTERO_ITEM_KEY = /^[A-Z0-9]{8}$/;
 const JOB_ID = /^[a-f0-9]{24}$/;
@@ -55,11 +57,53 @@ export function parseResearchTestOptions(argv) {
   return { itemKey, stateDir: resolvedStateDir };
 }
 
-export async function prepareResearchTestStateDir(policy) {
+export function parseAnnotationTestOptions(argv) {
+  let annotationKey = null;
+  let attachmentKey = null;
+  let stateDir = null;
+  const flags = new Map([
+    ['--annotation-test-key', 'annotationKey'],
+    ['--annotation-test-attachment', 'attachmentKey'],
+    ['--annotation-test-state-dir', 'stateDir'],
+  ]);
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const field = flags.get(argv[index]);
+    if (!field) continue;
+    const flag = argv[index];
+    const value = argv[index + 1];
+    if (!value || value.startsWith('--')) throw new Error(`${flag} 需要一个参数。`);
+    if (field === 'annotationKey') {
+      if (annotationKey !== null) throw new Error('--annotation-test-key 不能重复。');
+      annotationKey = value;
+    } else if (field === 'attachmentKey') {
+      if (attachmentKey !== null) throw new Error('--annotation-test-attachment 不能重复。');
+      attachmentKey = value;
+    } else {
+      if (stateDir !== null) throw new Error('--annotation-test-state-dir 不能重复。');
+      stateDir = value;
+    }
+    index += 1;
+  }
+
+  if (annotationKey === null && attachmentKey === null && stateDir === null) return null;
+  if (annotationKey === null || attachmentKey === null || stateDir === null)
+    throw new Error('--annotation-test-key、--annotation-test-attachment 与 --annotation-test-state-dir 必须一起提供。');
+  if (!ZOTERO_ITEM_KEY.test(annotationKey)) throw new Error('--annotation-test-key 必须是 8 位大写字母或数字 Zotero key。');
+  if (!ZOTERO_ITEM_KEY.test(attachmentKey)) throw new Error('--annotation-test-attachment 必须是 8 位大写字母或数字 Zotero key。');
+  if (!isAbsolute(stateDir)) throw new Error('--annotation-test-state-dir 必须是绝对路径。');
+  const resolvedStateDir = resolve(stateDir);
+  const stateRelativePath = relative(PRIVATE_STATE_ROOT, resolvedStateDir);
+  if (!stateRelativePath || stateRelativePath === '..' || stateRelativePath.startsWith(`..${sep}`) || isAbsolute(stateRelativePath))
+    throw new Error(`--annotation-test-state-dir 必须位于本机私有目录 ${PRIVATE_STATE_ROOT} 内，并使用独立子目录。`);
+  return { annotationKey, attachmentKey, stateDir: resolvedStateDir };
+}
+
+async function preparePrivateStateDir(policy, label) {
   if (!policy) return;
   const stateRelativePath = relative(PRIVATE_STATE_ROOT, policy.stateDir);
   if (!stateRelativePath || stateRelativePath === '..' || stateRelativePath.startsWith(`..${sep}`) || isAbsolute(stateRelativePath))
-    throw new Error(`研究测试缓存必须位于本机私有目录 ${PRIVATE_STATE_ROOT} 内。`);
+    throw new Error(`${label}必须位于本机私有目录 ${PRIVATE_STATE_ROOT} 内。`);
 
   let current = resolve(homedir());
   const homeStat = await lstat(current);
@@ -78,6 +122,45 @@ export async function prepareResearchTestStateDir(policy) {
   if (!state.isDirectory() || state.isSymbolicLink())
     throw new Error('研究测试缓存必须是本机私有普通目录，不能使用符号链接。');
   await chmod(policy.stateDir, 0o700);
+}
+
+export async function prepareResearchTestStateDir(policy) {
+  return preparePrivateStateDir(policy, '研究测试缓存');
+}
+
+export async function prepareAnnotationTestStateDir(policy) {
+  return preparePrivateStateDir(policy, '批注备注测试缓存');
+}
+
+export function createAnnotationTestGate(policy) {
+  const expectedReadKeys = ['annotationKey', 'attachmentKey', 'library'];
+  const expectedUpdateKeys = ['annotationKey', 'attachmentKey', 'comment', 'editToken', 'expectedComment', 'expectedVersion', 'library'];
+
+  function assertIdentity(args = {}, expectedKeys) {
+    if (!policy) throw new Error('Fixture 默认阻止批注备注读取与写入。');
+    const keys = Object.keys(args).sort();
+    if (keys.join(',') !== [...expectedKeys].sort().join(','))
+      throw new Error('批注备注参数必须严格符合 fixture 身份与版本保护字段。');
+    if (args.library !== 'user' || args.annotationKey !== policy.annotationKey || args.attachmentKey !== policy.attachmentKey)
+      throw new Error(`Fixture 只允许个人文库 ${policy.annotationKey}/${policy.attachmentKey}。`);
+  }
+
+  function assertRead(args = {}) {
+    assertIdentity(args, expectedReadKeys);
+  }
+
+  function assertUpdate(args = {}) {
+    assertIdentity(args, expectedUpdateKeys);
+    if (!Number.isSafeInteger(args.expectedVersion) || args.expectedVersion < 0)
+      throw new Error('批注备注更新必须提供有效 expectedVersion。');
+    if (typeof args.expectedComment !== 'string' || args.expectedComment.length > 20_000 ||
+        typeof args.comment !== 'string' || args.comment.length > 20_000)
+      throw new Error('批注备注更新必须提供有效的旧、新 comment 文本。');
+    if (typeof args.editToken !== 'string' || !/^[a-f0-9]{48}$/.test(args.editToken))
+      throw new Error('批注备注更新必须携带有效的短期 editToken。');
+  }
+
+  return { assertRead, assertUpdate };
 }
 
 export function createResearchTestGate(policy) {

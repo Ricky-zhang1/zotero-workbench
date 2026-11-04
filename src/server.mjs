@@ -1,6 +1,7 @@
 import { ResearchWorkspace } from './domain/research-workspace.mjs';
 import { CollaborationWorkspace } from './domain/collaboration-workspace.mjs';
 import { AnnotationTrash } from './domain/annotation-trash.mjs';
+import { AnnotationComment } from './domain/annotation-comment.mjs';
 import packageInfo from '../package.json' with { type: 'json' };
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -25,6 +26,7 @@ import { auditDocument, bindCitationFromDocument, readMarkdownDocument, MAX_MARK
 import { openZoteroLink } from './domain/native-links.mjs';
 import { applyReaderHighlightTags, READER_HIGHLIGHT_TYPE_TAGS } from './domain/reader-highlight-tags.mjs';
 import { annotationHighlightType } from './ui/highlight-presets.js';
+import { localAuthKeyFile } from './transports/local-auth.mjs';
 
 const transactions = new ReviewTransactions(process.env.ZOTERO_WORKBENCH_STATE_DIR || join(homedir(), '.local/share/zotero-workbench/operations'));
 
@@ -32,13 +34,15 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const run = promisify(execFile);
 const log = message => process.stderr.write(`[zotero-workbench] ${message}\n`);
 const baseUrl = localUrl(process.env.ZOTERO_URL, 'http://127.0.0.1:23119').origin;
-const session = new ZoteroSession({ baseUrl, keyFile: null, workspaceRoot: process.cwd(), pdfjsDataDir: join(root, 'dist/pdfjs'), log });
+const keyFile = await localAuthKeyFile();
+const session = new ZoteroSession({ baseUrl, keyFile, workspaceRoot: process.cwd(), pdfjsDataDir: join(root, 'dist/pdfjs'), log });
 installPagination(session.client);
 installCumulativeItems(session.library);
 installJournalLevelSummaries(session.library, journalLevelsForItem);
 const ricky = new RickyClient(process.env.ZOTERO_MCP_URL);
 const libraryActions = new LibraryActions({ session, client: ricky, transactions, parseIdentifier, resolveIdentifier });
 const annotationTrash = new AnnotationTrash({ session, directory: transactions.directory });
+const annotationComment = new AnnotationComment({ session, directory: transactions.directory });
 // Agent-proposed evidence highlights stay behind zotero-lattics review. Highlights
 // created by the reader's own selection popover carry origin='user' and save directly.
 const upstreamSaveHighlights = session.saveHighlights.bind(session);
@@ -586,6 +590,17 @@ register('create_reader_highlight', '高亮并保存', '把你本人在阅读器
     throw error;
   }
 }, { readOnly: false, appOnly: true });
+
+register('read_reader_annotation_comment', '读取批注备注', '精确读取同一文库中的现有批注及其父 PDF，返回当前备注、版本、来源指纹与30分钟一次性编辑凭证。此工具不写 Zotero。上次结果未知时会先只读核对；符合实例、版本、批注原文/颜色/标签/位置和备注指纹才解除编辑锁，否则返回 editable=false 且不签发新凭证。', {
+  library: librarySchema, annotationKey: keySchema, attachmentKey: keySchema
+}, args => annotationComment.read(args), { appOnly: true });
+register('update_reader_annotation_comment', '保存批注备注', '把备注保存到原 Zotero 批注的 annotationComment 字段，不创建独立笔记、不替换批注。必须使用读取工具签发且绑定版本和 Zotero 实例的一次性 editToken；写入只提交一次带 If-Unmodified-Since-Version 的 PATCH，并回读备注及原文、颜色、标签、位置。结果未知时不要重发，调用 read_reader_annotation_comment 核对当前备注，并可用 review_operation 查本机操作记录。', {
+  library: librarySchema, annotationKey: keySchema, attachmentKey: keySchema,
+  editToken: z.string().regex(/^[a-f0-9]{48}$/),
+  expectedVersion: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+  expectedComment: z.string().max(20000),
+  comment: z.string().max(20000)
+}, args => annotationComment.update(args), { readOnly: false, appOnly: true });
 
 register('prepare_reader_annotation_trash', '预览移除高亮', '为你在 Codex PDF 阅读器中选中的一条既有 Zotero 高亮生成短时预览。核对原文、备注、页码和 PDF 后，再明确确认；只标记这条高亮为已删除，绝不调用永久删除。工作台恢复入口须以回读核实为准，不承诺它会出现在 Zotero 顶层回收站。', {
   library: librarySchema, annotationKey: keySchema, attachmentKey: keySchema

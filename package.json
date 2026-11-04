@@ -1,6 +1,6 @@
 {
   "name": "zotero-workbench",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "本机 Zotero 文献工作台：支持 TextFold 五层阅读与研究导读、全文和外文高亮中文对照。翻译使用本机已配置的 Codex CLI；TextFold 另需研究运行环境。",
   "private": true,
   "type": "module",

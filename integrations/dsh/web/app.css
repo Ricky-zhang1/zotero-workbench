@@ -2766,6 +2766,8 @@ body.resizing .ws-body {
   position: fixed;
   z-index: 80;
   width: min(340px, calc(100vw - 24px));
+  max-height: calc(100vh - 24px);
+  overflow: auto;
   filter: drop-shadow(0 10px 28px rgb(15 23 42 / 0.28));
 }
 .ws-ann-popover-inner {
@@ -2815,6 +2817,65 @@ body.resizing .ws-body {
   font-size: var(--rb-font-size-xs);
   line-height: 1.6;
   overflow-wrap: anywhere;
+}
+.ws-ann-comment-edit {
+  align-self: flex-start;
+  min-height: 27px;
+  padding-inline: 9px;
+}
+.ws-ann-comment-editor {
+  display: grid;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid var(--rb-border);
+  border-radius: var(--rb-radius-sm);
+  background: var(--rb-surface-2);
+}
+.ws-ann-comment-label {
+  color: var(--rb-fg-muted);
+  font-size: var(--rb-font-size-xs);
+}
+.ws-ann-comment-input {
+  width: 100%;
+  min-height: 68px;
+  resize: vertical;
+  padding: 7px 8px;
+  border: 1px solid var(--rb-border-strong);
+  border-radius: var(--rb-radius-sm);
+  background: var(--rb-surface);
+  color: var(--rb-fg);
+  font: inherit;
+  font-size: var(--rb-font-size-sm);
+  line-height: 1.5;
+}
+.ws-ann-comment-input:disabled {
+  opacity: 0.72;
+}
+.ws-ann-comment-observed {
+  padding: 7px 8px;
+  border: 1px solid var(--rb-border);
+  border-radius: var(--rb-radius-sm);
+  background: var(--rb-surface);
+}
+.ws-ann-comment-observed p {
+  margin: 3px 0 0;
+  color: var(--rb-fg);
+  font-size: var(--rb-font-size-sm);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.ws-ann-comment-status {
+  margin: 0;
+  color: var(--rb-fg-muted);
+  font-size: var(--rb-font-size-xs);
+  line-height: 1.45;
+}
+.ws-ann-comment-status[data-tone="error"] { color: var(--rb-danger); }
+.ws-ann-comment-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
 }
 .ws-ann-tags {
   display: flex;

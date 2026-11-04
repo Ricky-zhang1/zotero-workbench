@@ -212,6 +212,16 @@ async function wbAddAnnotationContext(annotation,route) {
     var next=[...current];next[index]=source;return next;
   });
 }
+async function wbRefreshAnnotationContextComment(annotation,route,comment) {
+  var source=wbAnnotationSource({...annotation,comment},route),key=wbContextKey(source);
+  if(!wbContextState.sources.some(existing=>wbContextKey(existing)===key))return {updated:false};
+  var result=await wbChangeAnnotationContext(current=>{
+    var index=current.findIndex(existing=>wbContextKey(existing)===key);
+    if(index<0)return current;
+    var next=[...current];next[index]=source;return next;
+  });
+  return {...result,updated:true};
+}
 async function wbAddAnnotationContexts(annotations,route) {
   var sources=(annotations||[]).map(annotation=>wbAnnotationSource(annotation,route));
   if(!sources.length)throw new Error('请先选择当前 PDF 中的批注。');
@@ -699,6 +709,68 @@ async function wbRefreshReaderAnnotationResource(library,attachmentKey) {
   if(cached){cached.data=document;cached.error=undefined;cached.loading=false;}
   rl({tick:Co.tick+1});
 }
+var wbReaderAnnotationCommentInFlight=new Set();
+var wbReaderAnnotationCommentAttempts=new Map();
+function wbReaderAnnotationCommentTarget(annotation,route) {
+  var target={
+    library:String(route?.library||'user'),
+    annotationKey:String(annotation?.key||''),
+    attachmentKey:String(route?.attachmentKey||'')
+  };
+  if(!/^(user|g[1-9]\d*)$/.test(target.library)||!/^[A-Z0-9]{8}$/.test(target.annotationKey)||!/^[A-Z0-9]{8}$/.test(target.attachmentKey))
+    throw new Error('这条批注缺少有效的文库、批注 key 或 PDF key。');
+  return target;
+}
+function wbReaderAnnotationCommentKey(target) {
+  return [target.library,target.attachmentKey,target.annotationKey].join('/');
+}
+function wbReaderAnnotationCommentUiError(error,fallback) {
+  var message=String(error?.message||error||'').trim();
+  return /[\u3400-\u9fff]/.test(message)?message:fallback;
+}
+async function wbReadReaderAnnotationComment(annotation,route) {
+  var target=wbReaderAnnotationCommentTarget(annotation,route);
+  var result=await en.call('read_reader_annotation_comment',target);
+  if(result?.status!=='ready'||typeof result.comment!=='string'||!Number.isSafeInteger(result.annotationVersion)||
+      result.library!==target.library||result.annotationKey!==target.annotationKey||result.attachmentKey!==target.attachmentKey)
+    throw new Error(result?.lastOperation?.message||result?.editBlockedBy?.message||'没有读到这条批注当前备注和版本；尚未修改。');
+  var key=wbReaderAnnotationCommentKey(target),attempt=wbReaderAnnotationCommentAttempts.get(key);
+  if(attempt?.status==='outcome-unknown'&&result.lastOperation?.status!=='outcome-unknown'&&result.editable===true&&result.editToken)
+    wbReaderAnnotationCommentAttempts.delete(key);
+  return {target,comment:result.comment,annotationVersion:result.annotationVersion,attachmentVersion:result.attachmentVersion,
+    editable:result.editable===true,editToken:result.editToken||null,lastOperation:result.lastOperation||null,
+    editBlockedBy:result.editBlockedBy||null};
+}
+async function wbSaveReaderAnnotationComment(annotation,route,baseline,comment) {
+  var target=wbReaderAnnotationCommentTarget(annotation,route),key=wbReaderAnnotationCommentKey(target);
+  if(wbReaderAnnotationCommentInFlight.has(key)){
+    var pending=new Error('这条批注已在另一处保存；请稍候后重新读取。');pending.code='comment_write_in_flight';throw pending;
+  }
+  if(wbReaderAnnotationCommentAttempts.get(key)?.status==='outcome-unknown')
+    throw new Error('上次备注结果尚未核实。请先只读核对，不要重复保存。');
+  if(!baseline?.editable||!baseline.editToken||!Number.isSafeInteger(baseline.annotationVersion)||typeof baseline.comment!=='string')
+    throw new Error(baseline?.lastOperation?.message||baseline?.editBlockedBy?.message||'当前批注尚未获准编辑；请重新读取核对。');
+  wbReaderAnnotationCommentInFlight.add(key);
+  wbReaderAnnotationCommentAttempts.set(key,{status:'pending',comment});
+  try {
+    var result=await en.call('update_reader_annotation_comment',{
+      ...target,editToken:baseline.editToken,expectedVersion:baseline.annotationVersion,expectedComment:baseline.comment,comment
+    });
+    if(result?.status!=='verified'||result.verified!==true||result.comment!==comment||
+        result.library!==target.library||result.annotationKey!==target.annotationKey||result.attachmentKey!==target.attachmentKey){
+      var unknown=new Error(result?.message||'备注写入尚未通过回读核实。请只读核对当前备注，不要重复保存。');
+      unknown.code='comment_write_outcome_unknown';
+      wbReaderAnnotationCommentAttempts.set(key,{status:'outcome-unknown',comment,operationId:result?.operationId||null});
+      throw unknown;
+    }
+    wbReaderAnnotationCommentAttempts.delete(key);
+    return result;
+  } catch(error) {
+    if(wbReaderAnnotationCommentAttempts.get(key)?.status==='pending')
+      wbReaderAnnotationCommentAttempts.set(key,{status:'outcome-unknown',comment,operationId:error?.operationId||null});
+    throw error;
+  } finally { wbReaderAnnotationCommentInFlight.delete(key); }
+}
 async function wbUndoReaderAnnotationRemoval(operationId) {
   if(!/^[a-f0-9]{64}$/.test(String(operationId||'')))throw new Error('原批注移除操作编号无效。');
   var preview=await wbPrepareAnnotationRestore(operationId);
@@ -737,6 +809,86 @@ async function wbReconcileAnnotationOperation(operationId) {
   return en.call('reconcile_reader_annotation_operation',{operationId});
 }
 var wh = ar.createElement;
+function WorkbenchReaderAnnotationComment({annotation,route,notify,compact=false,onSaved}) {
+  var target;
+  try { target=wbReaderAnnotationCommentTarget(annotation,route); }
+  catch { return null; }
+  if(annotation?.type==='note')return null;
+  var identity=wbReaderAnnotationCommentKey(target);
+  var [editor,setEditor]=ar.useState(null);
+  var [busy,setBusy]=ar.useState(null);
+  var activeIdentity=ar.useRef(identity),requestId=ar.useRef(0);
+  activeIdentity.current=identity;
+  var current=editor?.identity===identity?editor:null;
+  var currentBusy=busy?.identity===identity?busy:null;
+  var isCurrent=id=>activeIdentity.current===identity&&requestId.current===id;
+  var report=(message,kind)=>{if(typeof notify==='function')notify(message,kind);};
+  var readCurrent=async({preserveDraft=false}={})=>{
+    var id=++requestId.current,previous=current;
+    setBusy({identity,action:'reading'});
+    try {
+      var latest=await wbReadReaderAnnotationComment(annotation,route);
+      if(!isCurrent(id))return;
+      var hadUnknown=previous?.status==='outcome-unknown'||previous?.baseline?.lastOperation?.status==='outcome-unknown'||previous?.baseline?.editBlockedBy?.status==='outcome-unknown';
+      var confirmedUnknown=hadUnknown&&latest.lastOperation?.status==='verified'&&
+        latest.lastOperation.currentCommentMatchesRequested===true&&latest.comment===previous.draft;
+      var confirmedRefresh=previous?.status==='verified-refresh-error'&&latest.lastOperation?.status==='verified'&&
+        latest.lastOperation.currentCommentMatchesRequested===true&&latest.comment===previous.draft;
+      if(confirmedUnknown||confirmedRefresh){
+        try { await wbRefreshReaderAnnotationResource(target.library,target.attachmentKey); }
+        catch(error){setEditor({...previous,status:'verified-refresh-error',error:`备注已回读核实，但阅读器刷新失败：${String(error?.message||error)}`,baseline:latest});return;}
+        setEditor(null);onSaved?.({comment:latest.comment,annotationKey:target.annotationKey,attachmentKey:target.attachmentKey,library:target.library});report('笔记已回读核实并刷新。');return;
+      }
+      var unresolved=latest.lastOperation?.status==='outcome-unknown'||!!latest.editBlockedBy;
+      setEditor({identity,mode:'edit',status:unresolved?'outcome-unknown':latest.editable?'editing':'blocked',draft:preserveDraft&&previous?previous.draft:latest.comment,
+        baseline:latest,error:latest.editable?(preserveDraft&&previous?'已读取最新备注与版本；草稿保留。':''):latest.lastOperation?.message||latest.editBlockedBy?.message||'当前批注暂不可编辑；可以重新读取核对。'});
+    } catch(error) {
+      if(!isCurrent(id))return;
+      var readError=wbReaderAnnotationCommentUiError(error,previous?'只读核对未完成；草稿仍保留，没有再次提交。':'未能读取当前备注；尚未修改，可以重新读取。');
+      setEditor(previous?{...previous,status:previous.status==='outcome-unknown'?'outcome-unknown':'read-error',error:readError}:
+        {identity,mode:'read-error',status:'read-error',draft:'',baseline:null,error:readError});
+    } finally { if(isCurrent(id))setBusy(null); }
+  };
+  var begin=()=>{void readCurrent();};
+  var save=async()=>{
+    if(!current||current.status!=='editing'||!current.baseline?.editable)return;
+    var id=++requestId.current;
+    setBusy({identity,action:'saving'});setEditor({...current,status:'saving',error:''});
+    try {
+      var saved=await wbSaveReaderAnnotationComment(annotation,route,current.baseline,current.draft);
+      if(!isCurrent(id))return;
+      var contextError=null;
+      try { await wbRefreshAnnotationContextComment(annotation,route,saved.comment); }
+      catch(error) { contextError=error; }
+      try { await wbRefreshReaderAnnotationResource(target.library,target.attachmentKey); }
+      catch(error){onSaved?.(saved);setEditor({...current,status:'verified-refresh-error',error:`笔记已核实保存，但阅读器刷新失败：${String(error?.message||error)}`});report(`笔记已核实保存，但阅读器刷新失败：${String(error?.message||error)}`,'error');return;}
+      setEditor(null);onSaved?.(saved);report(contextError?`笔记已保存并核实；当前上下文未能同步：${String(contextError?.message||contextError)}`:'笔记已保存并核实。',contextError?'error':undefined);
+    } catch(error) {
+      if(!isCurrent(id))return;
+      var inFlight=error?.code==='comment_write_in_flight';
+      var saveError=inFlight?String(error?.message||error):wbReaderAnnotationCommentUiError(error,'保存结果尚未核实，未重复提交；请先只读核对。');
+      setEditor({...current,status:inFlight?'editing':'outcome-unknown',error:saveError});
+      report(saveError,'error');
+    } finally { if(isCurrent(id))setBusy(null); }
+  };
+  var cancel=()=>{requestId.current++;setBusy(null);setEditor(null);};
+  var showEditor=!!current;
+  var label=String(annotation?.comment||'').trim()?'编辑笔记':'添加笔记';
+  var rootClass=`wb-reader-note${compact?' wb-reader-note--compact':''}`;
+  if(!showEditor)return wh('div',{className:rootClass},wh('button',{type:'button',className:'btn ghost sm wb-reader-note-trigger',disabled:!!currentBusy,onClick:begin,children:currentBusy?'读取中…':label}));
+  var blocked=current.status==='blocked'||current.status==='outcome-unknown'||current.status==='read-error'||current.status==='verified-refresh-error'||current.status==='saving';
+  var textarea=wh('textarea',{value:current.draft,disabled:current.status==='saving'||current.status==='verified-refresh-error',maxLength:20000,'aria-label':'阅读者备注',onChange:event=>setEditor(value=>value?.identity===identity?{...value,draft:event.target.value}:value)});
+  var actions=[];
+  if(current.status==='editing')actions.push(wh('button',{key:'save',type:'button',className:'btn primary sm',disabled:!!currentBusy||!current.baseline?.editable,onClick:save,children:currentBusy?.action==='saving'?'保存中…':'保存'}));
+  if(blocked&&current.status!=='saving')actions.push(wh('button',{key:'check',type:'button',className:'btn outline sm',disabled:!!currentBusy,onClick:()=>void readCurrent({preserveDraft:true}),children:currentBusy?.action==='reading'?'核对中…':current.status==='verified-refresh-error'?'重新读取并刷新':'只读核对'}));
+  actions.push(wh('button',{key:'cancel',type:'button',className:'btn ghost sm',disabled:current.status==='saving',onClick:cancel,children:'取消'}));
+  return wh('div',{className:`${rootClass} wb-reader-note--open`},
+    wh('div',{className:'wb-reader-note-editor'},
+      wh('label',{className:'wb-reader-note-label'},'阅读者备注'),
+      wh('p',{className:'wb-reader-note-help'},'只编辑备注；原文摘录保持不变。'),textarea,
+      current.error&&wh('div',{className:`wb-reader-note-status${current.status==='editing'?'':' wb-reader-note-status--error'}`,role:current.status==='editing'?'status':'alert'},current.error),
+      wh('div',{className:'wb-reader-note-actions'},...actions)));
+}
 function WorkbenchAnnotationRestore({operationId,onRestored}) {
   var [source,setSource]=ar.useState(null);
   var [restoreRecord,setRestoreRecord]=ar.useState(null);

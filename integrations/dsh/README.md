@@ -2,13 +2,13 @@
 
 本目录是 **DeepSeek Harness（DSH）侧的唯一接入点**，包含两个半侧、两个界面入口：
 
-- **Host 半侧**（`index.js`）：在 DSH Web 进程内注册同源只读路由 `/zotero-workbench/*`（文库、PDF、批注、引用导出、信息检查、`zotero://` 深链打开），并通过 `cordis.patch.yml` 用 `@deepseek-ai/dsh-mcp-client` 启动仓库根目录的标准 MCP 服务器（`../../src/server.mjs`）。
+- **Host 半侧**（`index.js`）：在 DSH Web 进程内注册同源路由 `/zotero-workbench/*`（文库、PDF、批注、引用导出、信息检查、`zotero://` 深链打开）。浏览 API 只读；全页阅读器另有一个受版本保护的接口，仅编辑现有批注的 `annotationComment`，并通过共享服务回读核实。插件同时通过 `cordis.patch.yml` 用 `@deepseek-ai/dsh-mcp-client` 启动仓库根目录的标准 MCP 服务器（`../../src/server.mjs`）。
 - **Client 半侧**（`client.js` + `web/`）：
   - **全页工作台**：左侧边栏「Zotero 工作台」入口 → 主面板 `?mode=workspace`（文库浏览、信息检查、多选加入对话/提问、详情栏、引用导出、PDF 阅读 + 真实批注矩形/浮层）。
   - **右栏阅读器**：`dsh-better-sidebar` 右侧边栏的「Zotero 文献」tab → `?mode=sidebar` 紧凑阅读器。
   - **研究工作台（0.12.0）**：在全页工作台按所选高亮、批注与笔记生成带来源回链的初稿，或对单篇 PDF 启动 TextFold 五层阅读。
 
-插件本体、Zotero 数据与写入规则仍只有一份：界面只读；一切写入仍走 MCP 工具的 预览 → 授权 → 确认 网关。
+Zotero 仍是文献与批注的唯一数据源。除全页阅读器里编辑既有批注备注外，浏览器界面只读；该备注功能不新建笔记或批注，写入前核对 Zotero 实例、PDF 来源、版本和旧备注，写后回读，结果未知时不重发。MCP 里的其他写入仍走预览、授权和确认网关。
 
 ![全页 Zotero 工作台](docs/workspace-main.png)
 
@@ -96,7 +96,7 @@ python3 scripts/setup-research.py
 
 ## Host API（浏览器同源）
 
-除明确标出的任务和打开操作外，以下浏览器 API 只读，不修改 Zotero 数据。
+除打开操作和专用批注备注接口外，以下浏览器 API 只读，不修改 Zotero 数据。
 
 | 路由 | 说明 |
 | --- | --- |
@@ -111,10 +111,11 @@ python3 scripts/setup-research.py
 | `GET /zotero-workbench/api/maintenance?view=unfiled\|missingDOI\|missingPDF&offset=&limit=` | 信息检查；服务端扫描 + 120s 缓存，返回总数/分页/truncated |
 | `POST /zotero-workbench/api/open` | `{kind:'item'\|'pdf', key, attachmentKey?, page?, annotationKey?}` → 打开 `zotero://select/library/items/...` 或 `zotero://open-pdf/library/items/...?page=&annotation=`；`ZOTERO_WORKBENCH_DSH_OPEN=0` 时只返回 URL 不启动（测试用） |
 | `POST /zotero-workbench/api/research` | `action=materials\|start\|status\|cancel`；材料读取为只读，启动/取消仅管理本机研究任务并保存私有任务缓存，不写 Zotero；AI 任务调用本机已配置的 Codex CLI |
+| `POST /zotero-workbench/api/annotation-comment` | 只支持读取/更新指定个人库 PDF 下的既有批注备注；更新需带短期 editToken、expectedVersion、expectedComment，并写后回读。不会新建笔记或批注；结果未知时不自动重试。只读核对请求不返回编辑 token |
 | `GET /zotero-workbench/app/*` | 阅读器静态资源（`web/`） |
 | `GET /zotero-workbench/pdfjs/*` | 仓库 `dist/pdfjs/` 的 cmaps/字体/wasm（pdf.js build 缺失时前端回退 `web/vendor/pdfjs/`） |
 
-安全：所有路由先过 `ctx.connection.requestRejection` 围栏（Host/Origin + DSH 会话 cookie），再按 `webServer.getOrigin()` 做 Host 白名单（防 DNS rebinding）；PDF 只从 Zotero 条目 enclosure 读取（realpath 限制在 Zotero storage 内 + `%PDF-` 头校验）；静态路由拒绝 dot-segment/符号链接穿越；`/api/open` 只允许两种 `zotero://` URL 且严格校验 key/page。所有响应 `Cache-Control: no-store`。
+安全：所有路由先过 `ctx.connection.requestRejection` 围栏（Host/Origin + DSH 会话 cookie），再按 `webServer.getOrigin()` 做 Host 白名单（防 DNS rebinding）；PDF 只从 Zotero 条目 enclosure 读取（realpath 限制在 Zotero storage 内 + `%PDF-` 头校验）；静态路由拒绝 dot-segment/符号链接穿越；`/api/open` 只允许两种 `zotero://` URL 且严格校验 key/page。批注备注接口只对精确 annotation/PDF 身份做版本保护的 `annotationComment` 修改；所有响应 `Cache-Control: no-store`。
 
 ## 已知限制
 

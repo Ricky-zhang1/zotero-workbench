@@ -1,13 +1,17 @@
 import { ResearchWorkspace } from '../../src/domain/research-workspace.mjs'
 import { CollaborationWorkspace } from '../../src/domain/collaboration-workspace.mjs'
+import { AnnotationComment } from '../../src/domain/annotation-comment.mjs'
 import { scanDuplicateCandidates, DuplicateScanError } from '../../src/domain/duplicates.mjs'
 import { journalLevelsForItem } from '../../src/domain/journal-levels.mjs'
+import { ZoteroSession } from '../../dist/runtime.mjs'
+import { localAuthKeyFile } from '../../src/transports/local-auth.mjs'
 /**
  * zotero-workbench-dsh — Host half（DSH 插件）。
  *
- * 职责：在 DSH 的同一个 Web 进程里提供只读的 Zotero 文献阅读器后端，供
- * `/zotero-workbench/app/` 的侧边栏 iframe 使用。全部实现只用 Node 标准库
- * （`node:fs`、`node:http`、全局 `fetch`），不依赖第三方包，也不写 Zotero。
+ * 职责：在 DSH 的同一个 Web 进程里提供 Zotero 文献阅读器后端，供
+ * `/zotero-workbench/app/` 的全页工作台和右栏阅读器使用。文库与 PDF API 只读；
+ * 独立的批注备注 API 仅更新已存在批注的 annotationComment，并由共享服务做来源/版本保护与回读核实。
+ * Host 路由实现只用 Node 标准库（`node:fs`、`node:http`、全局 `fetch`），不依赖第三方包。
  *
  * 路由（全部挂在本插件自己的前缀下，避开 DSH 自带 `/` 与 `/api` 的 Cookie 鉴权）：
  *   GET  /zotero-workbench                     → 302 到阅读器
@@ -24,6 +28,7 @@ import { journalLevelsForItem } from '../../src/domain/journal-levels.mjs'
  *   POST /zotero-workbench/api/open            → 用 zotero:// 深链在 Zotero 中定位条目/PDF（不写 Zotero）
  *   GET  /zotero-workbench/api/citation?id=    → 单条逐字引文登记（含角标 href 与 zotero:// 深链）
  *   GET  /zotero-workbench/api/citations?itemKey= → 同一文献的引文登记列表
+ *   POST /zotero-workbench/api/annotation-comment → 版本保护的当前 PDF 批注备注读取/更新
  *   POST /zotero-workbench/api/citation/:id/annotation → 本地写入个人高亮（Zotero 10 前恒 501 占位）
  *
  * 安全边界：
@@ -42,6 +47,7 @@ import { journalLevelsForItem } from '../../src/domain/journal-levels.mjs'
  * - 静态路由做 decodeURIComponent 容错、dot-segment 拒绝与 realpath 前缀校验（防符号链接穿越）。
  * - PDF 只从 Zotero 条目 JSON 的 enclosure（或 file/view/url）读取，并要求 realpath 落在
  *   Zotero storage 目录内；另外校验文件头含 `%PDF-`，避免被伪造元数据骗读任意文件。
+ * - 批注备注写入只允许个人库中精确匹配的 annotation/PDF；要求共享服务签发的短期凭证、旧备注与版本号，写后回读。未知结果不重发。
  * - API/PDF 响应统一 `Cache-Control: no-store`；错误统一 JSON `{error:{code,message}}`。
  *
  * 已知限制（MVP）：
@@ -97,6 +103,7 @@ const PDF_HEADER_PROBE = 1_024
 const KEY_PATTERN = /^[A-Za-z0-9]{1,32}$/
 /** Zotero API key 的严格形态（8 位大写字母数字）：用于 citations 与 open 的输入校验。 */
 const ZOTERO_KEY_PATTERN = /^[A-Z0-9]{8}$/
+const ANNOTATION_COMMENT_EDIT_TOKEN = /^[a-f0-9]{48}$/
 
 const CITATION_FORMATS = new Set(['bibtex', 'biblatex', 'ris', 'csljson', 'text'])
 const MAX_CITATION_KEYS = 200
@@ -2294,6 +2301,121 @@ async function handlePdf(state, req, res, url) {
   stream.pipe(res)
 }
 
+function exactObjectKeys(value, fields) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value) &&
+    Object.keys(value).sort().join(',') === [...fields].sort().join(',')
+}
+
+/** Narrow DSH bridge for the shared annotation-comment domain service. */
+export async function dispatchReaderAnnotationCommentRequest(service, request) {
+  const readOnly = request?.readOnly === true
+  const requestFields = readOnly ? ['tool', 'args', 'readOnly'] : ['tool', 'args']
+  if (!exactObjectKeys(request, requestFields) || !['read_reader_annotation_comment', 'update_reader_annotation_comment'].includes(request.tool) ||
+      (readOnly && request.tool !== 'read_reader_annotation_comment'))
+    throw new HttpError(400, 'invalid_annotation_comment_request', '批注备注请求格式无效。')
+  const readFields = ['library', 'annotationKey', 'attachmentKey']
+  const updateFields = [...readFields, 'editToken', 'expectedVersion', 'expectedComment', 'comment']
+  const fields = request.tool === 'read_reader_annotation_comment' ? readFields : updateFields
+  const args = request.args
+  if (!exactObjectKeys(args, fields) || args.library !== 'user' ||
+      typeof args.annotationKey !== 'string' || !ZOTERO_KEY_PATTERN.test(args.annotationKey) ||
+      typeof args.attachmentKey !== 'string' || !ZOTERO_KEY_PATTERN.test(args.attachmentKey))
+    throw new HttpError(400, 'invalid_annotation_comment_request', '批注备注身份或参数字段无效。')
+
+  try {
+    if (request.tool === 'read_reader_annotation_comment') {
+      const result = await service.read(args)
+      const hasEditToken = typeof result.editToken === 'string' && ANNOTATION_COMMENT_EDIT_TOKEN.test(result.editToken)
+      return {
+        status: result.status,
+        library: result.library,
+        annotationKey: result.annotationKey,
+        attachmentKey: result.attachmentKey,
+        comment: result.comment,
+        annotationVersion: result.annotationVersion,
+        attachmentVersion: result.attachmentVersion,
+        editable: !readOnly && result.editable === true && hasEditToken,
+        ...(readOnly ? { readOnly: true } : hasEditToken ? { editToken: result.editToken } : {}),
+        ...(!readOnly && Number.isSafeInteger(result.editTokenExpiresAt) ? { editTokenExpiresAt: result.editTokenExpiresAt } : {}),
+        ...(result.editBlockedBy ? { editBlockedBy: safeAnnotationCommentBlocker(result.editBlockedBy) } : {}),
+        ...(result.lastOperation ? { lastOperation: safeAnnotationCommentOperation(result.lastOperation) } : {}),
+      }
+    }
+
+    if (!ANNOTATION_COMMENT_EDIT_TOKEN.test(args.editToken) ||
+        !Number.isSafeInteger(args.expectedVersion) || args.expectedVersion < 0 ||
+        typeof args.expectedComment !== 'string' || args.expectedComment.length > 20_000 ||
+        typeof args.comment !== 'string' || args.comment.length > 20_000)
+      throw new HttpError(400, 'invalid_annotation_comment_request', '备注更新缺少有效的版本、旧备注、新备注或 editToken。')
+
+    const result = await service.update(args)
+    return {
+      status: result.status,
+      verified: result.verified === true,
+      changed: result.changed,
+      operationId: result.operationId,
+      library: result.library,
+      annotationKey: result.annotationKey,
+      attachmentKey: result.attachmentKey,
+      comment: result.comment,
+      annotationVersion: result.annotationVersion,
+      attachmentVersion: result.attachmentVersion,
+      ...(typeof result.message === 'string' ? { message: result.message } : {}),
+    }
+  } catch (error) {
+    if (error instanceof HttpError) throw error
+    if (error?.name !== 'AnnotationCommentError')
+      throw new HttpError(500, 'annotation_comment_error', '批注备注服务暂不可用。')
+    const status = error.code === 'not_found' ? 404
+      : error.code === 'zotero_unavailable' || error.code === 'read_failed' ? 503
+        : error.code === 'writes_unsupported' ? 501
+          : error.code === 'invalid_input' ? 400 : 409
+    throw new HttpError(status, 'annotation_comment_error', error.message)
+  }
+}
+
+function safeAnnotationCommentOperation(operation) {
+  const fields = ['operationId', 'status', 'submittedAt', 'verifiedAt', 'annotationVersion',
+    'currentCommentMatchesRequested', 'immutableSourceMatches', 'reconciliationPending', 'message']
+  return Object.fromEntries(fields.filter(field => operation[field] !== undefined).map(field => [field, operation[field]]))
+}
+
+function safeAnnotationCommentBlocker(blocker) {
+  return Object.fromEntries(['operationId', 'status', 'message']
+    .filter(field => blocker[field] !== undefined).map(field => [field, blocker[field]]))
+}
+
+async function readerAnnotationCommentService(state) {
+  if (state.annotationCommentService) return state.annotationCommentService
+  state.annotationCommentServicePromise ||= (async () => {
+    const keyFile = await localAuthKeyFile()
+    const session = new ZoteroSession({
+      baseUrl: new URL(state.zoteroUrl).origin,
+      keyFile,
+      workspaceRoot: REPO_ROOT,
+      pdfjsDataDir: PDFJS_DIR,
+      log: () => {},
+    })
+    state.annotationCommentSession = session
+    state.annotationCommentService = new AnnotationComment({
+      session,
+      directory: readerAnnotationCommentOperationsDirectory(keyFile),
+    })
+    return state.annotationCommentService
+  })()
+  try {
+    return await state.annotationCommentServicePromise
+  } catch (error) {
+    state.annotationCommentServicePromise = null
+    throw error
+  }
+}
+
+export function readerAnnotationCommentOperationsDirectory(keyFile, env = process.env) {
+  const stateRoot = dirname(resolve(keyFile))
+  return env?.ZOTERO_WORKBENCH_STATE_DIR ? stateRoot : join(stateRoot, 'operations')
+}
+
 async function handleApi(state, req, res) {
   const url = requestUrl(req)
   const { pathname } = url
@@ -2301,6 +2423,12 @@ async function handleApi(state, req, res) {
     throw new HttpError(404, 'not_found', '未知路径。')
   }
   const endpoint = pathname.slice(API_PATH.length).replace(/\/+$/, '')
+  if (endpoint === '/annotation-comment') {
+    if (req.method !== 'POST') { sendMethodNotAllowed(res, ['POST']); return }
+    const body = await readJsonBody(req)
+    const result = await dispatchReaderAnnotationCommentRequest(await readerAnnotationCommentService(state), body)
+    return sendJson(res, 200, result)
+  }
   if(endpoint === '/research') {
     if(req.method !== 'POST'){sendMethodNotAllowed(res,['POST']);return}
     const body=await readJsonBody(req)
@@ -2412,6 +2540,9 @@ function createState(ctx, config) {
     maintenanceCache: new Map(),
     topItemsPromise: null,
     pdfParentsPromise: null,
+    annotationCommentService: null,
+    annotationCommentServicePromise: null,
+    annotationCommentSession: null,
   }
   state.checkHost = createHostChecker(ctx)
   return state
@@ -2532,6 +2663,7 @@ export function apply(ctx, config = {}) {
 
   return () => {
     state.research?.close()
+    state.annotationCommentSession?.close()
     for (const dispose of disposers.splice(0)) {
       try {
         dispose()

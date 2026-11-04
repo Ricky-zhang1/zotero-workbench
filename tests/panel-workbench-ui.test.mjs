@@ -29,6 +29,11 @@ let workbenchStatusHandler = null;
 let researchMaterialsResponse = null;
 let collaborationSessionResponse = null;
 let collaborationFeedbackResponse = null;
+let readAnnotationCommentHandler = null;
+let updateAnnotationCommentHandler = null;
+let readerAnnotationDocument = { annotations: [] };
+const annotationResourceCache = new Map();
+const readerAnnotationRefreshes = [];
 const fakeTimers = new Map();
 let fakeNow = 0;
 let nextTimerId = 1;
@@ -63,6 +68,10 @@ const en = {
       return readerOperationsHandler ? readerOperationsHandler(args) : { operations: [], total: 0, nextOffset: null, currentServerId: 'test-server' };
     if (name === 'workbench_state' && workbenchStateError) throw workbenchStateError;
     if (name === 'workbench_status' && workbenchStatusHandler) return workbenchStatusHandler();
+    if (name === 'read_reader_annotation_comment')
+      return readAnnotationCommentHandler ? readAnnotationCommentHandler(args) : { status: 'ready', ...args, comment: '', annotationVersion: 1, editable: true, editToken: 'e'.repeat(48), lastOperation: null };
+    if (name === 'update_reader_annotation_comment')
+      return updateAnnotationCommentHandler ? updateAnnotationCommentHandler(args) : { status: 'verified', verified: true, changed: true, ...args, comment: args.comment, annotationVersion: args.expectedVersion + 1, operationId: 'd'.repeat(64) };
     if (name === 'research_materials') return researchMaterialsResponse;
     if (name === 'collaboration_session') {
       if (args.action === 'list') return { sessions: [] };
@@ -80,6 +89,7 @@ const en = {
     return {};
   },
   openLink: async url => { bridgeCalls.push({ name: 'openLink', args: { url } }); return { accepted: true }; },
+  readJson: async uri => { readerAnnotationRefreshes.push(uri); return structuredClone(readerAnnotationDocument); },
   updateModelContext: async (...args) => { if (contextUpdateError) throw contextUpdateError; messageCalls.push({ kind: 'context', args }); },
   sendMessage: async (...args) => { messageCalls.push({ kind: 'message', args }); },
 };
@@ -90,6 +100,10 @@ const context = {
     useEffect: () => {},
   },
   en,
+  rr: { annotations: (library, attachmentKey) => `reader-annotations://${library}/${attachmentKey}` },
+  wf: { get: uri => annotationResourceCache.get(uri) },
+  Co: { tick: 4 },
+  rl: value => { readerAnnotationRefreshes.push(value); },
   wbHighlightPresets,
   uiEvents: [],
   window: { matchMedia: () => ({ matches: true }), dispatchEvent: event => { context.uiEvents.push(event); return true; }, addEventListener: () => {}, removeEventListener: () => {} },
@@ -114,7 +128,58 @@ async function resetTrashState() {
   });
 }
 vm.createContext(context);
-vm.runInContext(`${workspaceSource}\n${extensionSource}\nglobalThis.uiTest = { wbConnectionSummary, wbStartConnectionStatusRequest, wbRankLabels, wbRankLevels, wbRankTone, wbRankBlock, wbInspectorItem, wbAnnotationSource, wbAnnotationPrompt, wbAddAnnotationContext, wbAddAnnotationContexts, wbAskAnnotation, wbRemoveAnnotationContext, wbClearAnnotationContext, wbContextSnapshot, wbContextKey, wbContextPayload, wbContextMetadata, wbSendAnnotationContextMessage, wbReadCollaborationMaterialRecords, wbCollaborationSourceSelectors, wbListCollaborationSessions, wbListCollaborationFeedback, wbLoadCollaborationSession, wbLoadCollaborationDraft, wbCollaborationDecisionLabel, wbCollaborationRangeLabel, wbCollaborationContextSources, wbCollaborationSourceStatus, wbCollaborationSourceReference, wbReplaceContextWithCollaborationSession, wbSetCollaborationContextSession, wbCollaborationFeedbackMessage, wbSendCollaborationFeedbackMessage, WorkbenchCollaboration, wbPrepareAnnotationTrash, wbConfirmAnnotationTrash, wbRememberTrashedAnnotation, wbTrackReaderTrashOperation, wbPrepareAnnotationRestore, wbConfirmAnnotationRestore, wbReconcileAnnotationOperation, wbTrashReaderAnnotationsBatch, wbRemoveReaderAnnotationOnce, wbUndoReaderAnnotationRemoval, wbReaderTrashOperationIds, wbReaderTrashAttempt, wbReaderTrashInFlight, wbSetReaderTrashLedgerOperations, wbReadReaderTrashOperations, wbResetReaderTrashLedger, wbReaderTrashLedgerOperation, wbSelectableReaderAnnotations, wbSelectedReaderAnnotations, wbSelectedReaderHighlights, wbReaderAnnotationSelectionToggle, wbReaderAnnotationSelectionForRoute, wbReaderAnnotationCopyText, wbCopyReaderAnnotations, wbReaderTrashErrorResult, wbOpenTarget, wbOpenTargetWithFeedback, WorkbenchAnnotationRestore, wbQueueItemOpen, wbCancelItemOpen };`, context);
+vm.runInContext(`${workspaceSource}\n${extensionSource}\nglobalThis.uiTest = { wbConnectionSummary, wbStartConnectionStatusRequest, wbRankLabels, wbRankLevels, wbRankTone, wbRankBlock, wbInspectorItem, wbAnnotationSource, wbAnnotationPrompt, wbAddAnnotationContext, wbRefreshAnnotationContextComment, wbAddAnnotationContexts, wbAskAnnotation, wbRemoveAnnotationContext, wbClearAnnotationContext, wbContextSnapshot, wbContextKey, wbContextPayload, wbContextMetadata, wbSendAnnotationContextMessage, wbReadCollaborationMaterialRecords, wbCollaborationSourceSelectors, wbListCollaborationSessions, wbListCollaborationFeedback, wbLoadCollaborationSession, wbLoadCollaborationDraft, wbCollaborationDecisionLabel, wbCollaborationRangeLabel, wbCollaborationContextSources, wbCollaborationSourceStatus, wbCollaborationSourceReference, wbReplaceContextWithCollaborationSession, wbSetCollaborationContextSession, wbCollaborationFeedbackMessage, wbSendCollaborationFeedbackMessage, WorkbenchCollaboration, wbPrepareAnnotationTrash, wbConfirmAnnotationTrash, wbRememberTrashedAnnotation, wbTrackReaderTrashOperation, wbPrepareAnnotationRestore, wbConfirmAnnotationRestore, wbReconcileAnnotationOperation, wbTrashReaderAnnotationsBatch, wbRemoveReaderAnnotationOnce, wbUndoReaderAnnotationRemoval, wbReaderTrashOperationIds, wbReaderTrashAttempt, wbReaderTrashInFlight, wbSetReaderTrashLedgerOperations, wbReadReaderTrashOperations, wbResetReaderTrashLedger, wbReaderTrashLedgerOperation, wbSelectableReaderAnnotations, wbSelectedReaderAnnotations, wbSelectedReaderHighlights, wbReaderAnnotationSelectionToggle, wbReaderAnnotationSelectionForRoute, wbReaderAnnotationCopyText, wbCopyReaderAnnotations, wbReaderTrashErrorResult, wbReaderAnnotationCommentInFlight, wbReaderAnnotationCommentAttempts, wbReadReaderAnnotationComment, wbSaveReaderAnnotationComment, WorkbenchReaderAnnotationComment, wbOpenTarget, wbOpenTargetWithFeedback, WorkbenchAnnotationRestore, wbQueueItemOpen, wbCancelItemOpen };`, context);
+
+function createHookHarness(component, initialProps) {
+  const originalAr = context.ar;
+  const slots = [];
+  let cursor = 0;
+  let props = initialProps;
+  context.ar = {
+    ...originalAr,
+    useState(initial) {
+      const index = cursor++;
+      if (!(index in slots)) slots[index] = typeof initial === 'function' ? initial() : initial;
+      return [slots[index], next => { slots[index] = typeof next === 'function' ? next(slots[index]) : next; }];
+    },
+    useRef(initial) {
+      const index = cursor++;
+      if (!(index in slots)) slots[index] = { current: initial };
+      return slots[index];
+    },
+    useEffect() {},
+  };
+  return {
+    render(nextProps = props) { props = nextProps; cursor = 0; return component(props); },
+    restore() { context.ar = originalAr; },
+  };
+}
+function treeText(node) {
+  if (node == null || typeof node === 'boolean') return '';
+  if (typeof node === 'string' || typeof node === 'number') return String(node);
+  if (Array.isArray(node)) return node.map(treeText).join('');
+  return treeText(node.props?.children);
+}
+function findTreeNode(rootNode, predicate) {
+  if (!rootNode) return null;
+  if (Array.isArray(rootNode)) {
+    for (const child of rootNode) { const found = findTreeNode(child, predicate); if (found) return found; }
+    return null;
+  }
+  if (typeof rootNode !== 'object') return null;
+  if (predicate(rootNode)) return rootNode;
+  return findTreeNode(rootNode.props?.children, predicate);
+}
+async function resetAnnotationCommentHarness() {
+  readAnnotationCommentHandler = null;
+  updateAnnotationCommentHandler = null;
+  readerAnnotationDocument = { annotations: [] };
+  annotationResourceCache.clear();
+  readerAnnotationRefreshes.length = 0;
+  context.uiTest.wbReaderAnnotationCommentInFlight.clear();
+  context.uiTest.wbReaderAnnotationCommentAttempts.clear();
+  await context.uiTest.wbClearAnnotationContext();
+}
 
 test('connection indicator follows local Zotero API and treats external Zotero MCP as optional', () => {
   const disconnectedMcp = context.uiTest.wbConnectionSummary({
@@ -851,9 +916,157 @@ test('native panel build wires main-row double-click and popover actions at pinn
   assert.ok(extensionSource.includes('恢复只针对原批注 key'));
 });
 
+test('saved annotation note editing is reachable from the popover and each PDF sidebar annotation row', () => {
+  assert.equal((buildSource.match(/WorkbenchReaderAnnotationComment/g) || []).length, 2, 'the popover and sidebar each mount one editor');
+  assert.ok(buildSource.includes('onSaved:()=>s()'), 'a verified popover edit closes the stale annotation snapshot');
+  assert.ok(buildSource.includes('ie.kind==="annotation"&&(0,dt.jsx)(WorkbenchReaderAnnotationComment'), 'each Zotero sidebar annotation row has an independent note action');
+  assert.ok(buildSource.includes('children:ie.kind==="annotation"?ie.annotation.text||"（无原文摘录）":ie.highlight.quote'));
+  assert.ok(buildSource.includes('ie.kind==="annotation"&&ie.annotation.comment'), 'reader comments remain separate from original text');
+  assert.match(extensionCss, /\.wb-reader-note-editor textarea\{[^}]*font-size:14px/);
+  assert.match(extensionCss, /\.reader \.wb-reader-annotation-row\{[^}]*flex-wrap:wrap/);
+  assert.match(extensionCss, /\.reader \.wb-reader-annotation-row>\.wb-reader-note\{[^}]*box-sizing:border-box;flex:0 0 calc\(100% - 30px\);max-width:calc\(100% - 30px\)/);
+  assert.match(extensionCss, /\.reader \.wb-reader-annotation-row>\.wb-reader-note--open\{flex-basis:calc\(100% - 30px\);max-width:calc\(100% - 30px\)/);
+  assert.ok(extensionSource.includes('wbRefreshAnnotationContextComment'));
+  assert.ok(buildSource.includes('children:"原文摘录"')&&buildSource.includes('children:"阅读者备注"'));
+});
+
+test('annotation note editor reads the latest comment, preserves a draft across resource updates, and cancel sends no write', async () => {
+  await resetAnnotationCommentHarness();
+  const route = { library: 'user', itemKey: 'ITEM1234', title: '当前文献', attachmentKey: 'PDF12345' };
+  const annotation = { key: 'ANN12345', type: 'highlight', pageIndex: 0, text: '作者原文', comment: '' };
+  readAnnotationCommentHandler = args => ({ status: 'ready', ...args, comment: '服务端最新备注', annotationVersion: 31, attachmentVersion: 8, editable: true, editToken: 'a'.repeat(48), lastOperation: null });
+  const harness = createHookHarness(context.uiTest.WorkbenchReaderAnnotationComment, { annotation, route });
+  try {
+    let tree = harness.render();
+    const open = findTreeNode(tree, node => node.type === 'button' && treeText(node) === '添加笔记');
+    assert.ok(open);
+    open.props.onClick();
+    await new Promise(resolve => setImmediate(resolve));
+    tree = harness.render();
+    let textarea = findTreeNode(tree, node => node.type === 'textarea');
+    assert.equal(textarea.props.value, '服务端最新备注');
+    assert.deepEqual(plain(bridgeCalls.filter(call => call.name === 'read_reader_annotation_comment').at(-1)), {
+      name: 'read_reader_annotation_comment', args: { library: 'user', annotationKey: 'ANN12345', attachmentKey: 'PDF12345' },
+    });
+    textarea.props.onChange({ target: { value: '保留中的新草稿' } });
+    tree = harness.render({ annotation: { ...annotation, comment: '资源刷新来的其他值' }, route });
+    textarea = findTreeNode(tree, node => node.type === 'textarea');
+    assert.equal(textarea.props.value, '保留中的新草稿', 'refreshing annotation props must not replace an in-progress draft');
+    findTreeNode(tree, node => node.type === 'button' && treeText(node) === '取消').props.onClick();
+    assert.equal(findTreeNode(harness.render(), node => node.type === 'textarea'), null);
+    assert.equal(bridgeCalls.filter(call => call.name === 'update_reader_annotation_comment').length, 0);
+  } finally { harness.restore(); }
+});
+
+test('verified annotation note save refreshes the reader and the selected AI context exactly once', async () => {
+  await resetAnnotationCommentHarness();
+  const route = { library: 'user', itemKey: 'ITEM1234', title: '当前文献', attachmentKey: 'PDF12345' };
+  const annotation = { key: 'ANN12345', type: 'highlight', pageIndex: 2, text: '作者原文', comment: '旧备注' };
+  await context.uiTest.wbAddAnnotationContext(annotation, route);
+  readAnnotationCommentHandler = args => ({ status: 'ready', ...args, comment: '读取到的旧备注', annotationVersion: 42, attachmentVersion: 9, editable: true, editToken: 'b'.repeat(48), lastOperation: null });
+  updateAnnotationCommentHandler = args => ({ status: 'verified', verified: true, changed: true, ...args, comment: args.comment, annotationVersion: 43, operationId: 'c'.repeat(64) });
+  readerAnnotationDocument = { annotations: [{ key: 'ANN12345', text: '作者原文', comment: '更新后的阅读者备注' }] };
+  const uri = 'reader-annotations://user/PDF12345';
+  const cached = { data: { annotations: [{ key: 'ANN12345', text: '作者原文', comment: '读取到的旧备注' }] }, loading: false };
+  annotationResourceCache.set(uri, cached);
+  const notices = [];
+  let savedCallbackCount = 0;
+  const harness = createHookHarness(context.uiTest.WorkbenchReaderAnnotationComment, { annotation, route, notify: (...args) => notices.push(args), onSaved: () => savedCallbackCount++ });
+  try {
+    let tree = harness.render();
+    findTreeNode(tree, node => node.type === 'button' && treeText(node) === '编辑笔记').props.onClick();
+    await new Promise(resolve => setImmediate(resolve));
+    tree = harness.render();
+    const textarea = findTreeNode(tree, node => node.type === 'textarea');
+    assert.equal(textarea.props.value, '读取到的旧备注');
+    textarea.props.onChange({ target: { value: '更新后的阅读者备注' } });
+    tree = harness.render();
+    findTreeNode(tree, node => node.type === 'button' && treeText(node) === '保存').props.onClick();
+    await new Promise(resolve => setImmediate(resolve));
+    tree = harness.render();
+    assert.equal(findTreeNode(tree, node => node.type === 'textarea'), null);
+    const calls = bridgeCalls.filter(call => call.name === 'update_reader_annotation_comment');
+    assert.equal(calls.length, 1);
+    assert.deepEqual(plain(calls[0].args), {
+      library: 'user', annotationKey: 'ANN12345', attachmentKey: 'PDF12345', editToken: 'b'.repeat(48),
+      expectedVersion: 42, expectedComment: '读取到的旧备注', comment: '更新后的阅读者备注',
+    });
+    assert.equal(cached.data.annotations[0].comment, '更新后的阅读者备注');
+    assert.ok(readerAnnotationRefreshes.includes(uri));
+    assert.ok(readerAnnotationRefreshes.some(value => value?.tick === 5));
+    assert.equal(savedCallbackCount, 1, 'the popover caller can close its stale annotation snapshot after verified save');
+    assert.equal(context.uiTest.wbContextSnapshot()[0].comment, '更新后的阅读者备注');
+    assert.match(messageCalls.filter(call => call.kind === 'context').at(-1).args[0], /阅读者备注：\n更新后的阅读者备注/);
+    assert.ok(notices.some(([message]) => message === '笔记已保存并核实。'));
+  } finally { harness.restore(); }
+});
+
+test('unknown annotation note writes keep the draft and only reconcile through a read-only check', async () => {
+  await resetAnnotationCommentHarness();
+  const priorUpdateCount = bridgeCalls.filter(call => call.name === 'update_reader_annotation_comment').length;
+  const route = { library: 'user', itemKey: 'ITEM1234', title: '当前文献', attachmentKey: 'PDF12345' };
+  const annotation = { key: 'ANN12345', type: 'highlight', pageIndex: 0, text: '原文', comment: '' };
+  let phase = 0;
+  readAnnotationCommentHandler = args => phase === 0
+    ? ({ status: 'ready', ...args, comment: '旧备注', annotationVersion: 8, attachmentVersion: 2, editable: true, editToken: 'c'.repeat(48), lastOperation: null })
+    : phase === 1
+      ? ({ status: 'ready', ...args, comment: '旧备注', annotationVersion: 8, attachmentVersion: 2, editable: false, editToken: null, lastOperation: { status: 'outcome-unknown', message: '仍待核对' } })
+      : ({ status: 'ready', ...args, comment: '研究者的新备注', annotationVersion: 9, attachmentVersion: 2, editable: true, editToken: 'd'.repeat(48), lastOperation: { status: 'verified', currentCommentMatchesRequested: true } });
+  updateAnnotationCommentHandler = args => ({ status: 'outcome-unknown', verified: false, changed: null, ...args, operationId: 'e'.repeat(64), message: 'Timeout: tools/call' });
+  readerAnnotationDocument = { annotations: [{ key: 'ANN12345', text: '原文', comment: '研究者的新备注' }] };
+  const harness = createHookHarness(context.uiTest.WorkbenchReaderAnnotationComment, { annotation, route });
+  try {
+    let tree = harness.render();
+    findTreeNode(tree, node => node.type === 'button' && treeText(node) === '添加笔记').props.onClick();
+    await new Promise(resolve => setImmediate(resolve));
+    tree = harness.render();
+    findTreeNode(tree, node => node.type === 'textarea').props.onChange({ target: { value: '研究者的新备注' } });
+    tree = harness.render();
+    findTreeNode(tree, node => node.type === 'button' && treeText(node) === '保存').props.onClick();
+    await new Promise(resolve => setImmediate(resolve));
+    tree = harness.render();
+    assert.equal(findTreeNode(tree, node => node.type === 'textarea').props.value, '研究者的新备注');
+    assert.match(treeText(tree), /保存结果尚未核实，未重复提交；请先只读核对。/);
+    assert.equal(bridgeCalls.filter(call => call.name === 'update_reader_annotation_comment').length - priorUpdateCount, 1);
+    phase = 1;
+    findTreeNode(tree, node => node.type === 'button' && treeText(node) === '只读核对').props.onClick();
+    await new Promise(resolve => setImmediate(resolve));
+    tree = harness.render();
+    assert.equal(findTreeNode(tree, node => node.type === 'textarea').props.value, '研究者的新备注');
+    assert.equal(bridgeCalls.filter(call => call.name === 'update_reader_annotation_comment').length - priorUpdateCount, 1, 'an unresolved readback must not resend the write');
+    phase = 2;
+    findTreeNode(tree, node => node.type === 'button' && treeText(node) === '只读核对').props.onClick();
+    await new Promise(resolve => setImmediate(resolve));
+    tree = harness.render();
+    assert.equal(findTreeNode(tree, node => node.type === 'textarea'), null, 'an exact backend reconciliation refreshes the reader and closes the editor');
+    assert.equal(bridgeCalls.filter(call => call.name === 'update_reader_annotation_comment').length - priorUpdateCount, 1);
+  } finally { harness.restore(); }
+});
+
+test('a pending note read from a prior annotation cannot replace the new route editor', async () => {
+  await resetAnnotationCommentHarness();
+  const route = { library: 'user', itemKey: 'ITEM1234', title: '当前文献', attachmentKey: 'PDF12345' };
+  const oldAnnotation = { key: 'ANN12345', type: 'highlight', pageIndex: 0, text: '旧原文', comment: '' };
+  let resolveRead;
+  readAnnotationCommentHandler = () => new Promise(resolve => { resolveRead = resolve; });
+  const harness = createHookHarness(context.uiTest.WorkbenchReaderAnnotationComment, { annotation: oldAnnotation, route });
+  try {
+    let tree = harness.render();
+    findTreeNode(tree, node => node.type === 'button' && treeText(node) === '添加笔记').props.onClick();
+    tree = harness.render({ annotation: { key: 'ANN54321', type: 'highlight', pageIndex: 1, text: '新原文', comment: '' }, route: { ...route, attachmentKey: 'PDF54321' } });
+    resolveRead({ status: 'ready', library: 'user', annotationKey: 'ANN12345', attachmentKey: 'PDF12345', comment: '旧来源备注', annotationVersion: 1, editable: true, editToken: 'f'.repeat(48) });
+    await new Promise(resolve => setImmediate(resolve));
+    tree = harness.render();
+    assert.equal(findTreeNode(tree, node => node.type === 'textarea'), null);
+    assert.ok(findTreeNode(tree, node => node.type === 'button' && treeText(node) === '添加笔记'));
+  } finally { harness.restore(); }
+});
+
 test('saved annotation popover uses system typography, constrained width, and a collapsible body', () => {
   assert.match(extensionCss, /\.popover\s*\{[^}]*font-family:var\(--z-font/);
   assert.match(extensionCss, /\.popover \.quote\s*\{[^}]*font-family:inherit/);
   assert.match(extensionCss, /\.popover\s*\{[^}]*width:min\(380px/);
   assert.match(extensionCss, /\.popover \.wb-annotation-content/);
+  assert.match(extensionCss, /\.wb-reader-note-editor textarea\{[^}]*font-size:14px/);
+  assert.match(extensionCss, /\.wb-annotation-label\{/);
 });

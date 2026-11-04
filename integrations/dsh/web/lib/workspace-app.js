@@ -127,6 +127,8 @@ const state = {
   health: null,
   bridge: { connected: false, embedded: false },
   popoverAnnotationKey: '',
+  annotationCommentEdit: null,
+  annotationCommentRequest: 0,
   booted: false,
 };
 
@@ -323,6 +325,21 @@ function shellHtml() {
       </div>
       <blockquote class="ws-ann-quote" id="ws-ann-quote"></blockquote>
       <p class="ws-ann-comment" id="ws-ann-comment"></p>
+      <button class="btn btn-quiet ws-ann-comment-edit" type="button" id="ws-ann-comment-edit" data-ws-action="ann-comment-edit">添加备注</button>
+      <div class="ws-ann-comment-editor" id="ws-ann-comment-editor" hidden>
+        <label class="ws-ann-comment-label" for="ws-ann-comment-input">阅读者备注（写入当前 Zotero 批注）</label>
+        <textarea class="ws-ann-comment-input" id="ws-ann-comment-input" rows="3" maxlength="20000"></textarea>
+        <div class="ws-ann-comment-observed" id="ws-ann-comment-observed" hidden>
+          <span class="ws-ann-comment-label">Zotero 当前备注（只读）</span>
+          <p id="ws-ann-comment-observed-text"></p>
+        </div>
+        <p class="ws-ann-comment-status" id="ws-ann-comment-status" role="status" aria-live="polite" hidden></p>
+        <div class="ws-ann-comment-actions">
+          <button class="btn btn-quiet" type="button" id="ws-ann-comment-reconcile" data-ws-action="ann-comment-reconcile" hidden>只读核对</button>
+          <button class="btn btn-quiet" type="button" data-ws-action="ann-comment-cancel">取消</button>
+          <button class="btn btn-primary" type="button" id="ws-ann-comment-save" data-ws-action="ann-comment-save">保存备注</button>
+        </div>
+      </div>
       <div class="ws-ann-tags" id="ws-ann-tags"></div>
       <div class="ws-ann-popover-actions">
         <button class="btn btn-primary" type="button" data-ws-action="ann-open-zotero">${icon('external', 13)}<span>在 Zotero 中显示</span></button>
@@ -420,6 +437,14 @@ export async function startWorkspaceApp({ root: rootNode }) {
     annPage: $('#ws-ann-page', root),
     annQuote: $('#ws-ann-quote', root),
     annComment: $('#ws-ann-comment', root),
+    annCommentEditBtn: $('#ws-ann-comment-edit', root),
+    annCommentEditor: $('#ws-ann-comment-editor', root),
+    annCommentInput: $('#ws-ann-comment-input', root),
+    annCommentObserved: $('#ws-ann-comment-observed', root),
+    annCommentObservedText: $('#ws-ann-comment-observed-text', root),
+    annCommentStatus: $('#ws-ann-comment-status', root),
+    annCommentReconcile: $('#ws-ann-comment-reconcile', root),
+    annCommentSave: $('#ws-ann-comment-save', root),
     annTags: $('#ws-ann-tags', root),
     askModal: $('#ws-ask-modal', root),
     askInput: $('#ws-ask-input', root),
@@ -840,6 +865,10 @@ function renderSavedSearchNav() {
 }
 
 function setNav(next) {
+  if (state.annotationCommentEdit?.status === 'saving') {
+    setAnnotationCommentStatus('Zotero 备注写入请求仍在处理；请先等待回执，当前草稿会保留。', 'info');
+    return;
+  }
   state.nav = next;
   if (next.kind === 'collection') {
     let cursor = state.collections.find((collection) => collection.key === next.key);
@@ -1219,6 +1248,10 @@ async function sendOrCopy(type, payload, fallbackText, successMessage) {
 /* ============================== 条目详情 ============================== */
 
 async function selectItem(key, { skipReload = false, preserveCitationReveal = false } = {}) {
+  if (state.annotationCommentEdit?.status === 'saving' && key !== state.currentKey) {
+    setAnnotationCommentStatus('Zotero 备注写入请求仍在处理；请先等待回执，当前草稿会保留。', 'info');
+    return;
+  }
   if (!key) return;
   if (
     !preserveCitationReveal &&
@@ -1792,6 +1825,24 @@ export async function callResearchToolWithApi(apiClient, name, args = {}) {
   return apiClient.requestJson('/research', { method: 'POST', body });
 }
 
+export async function callReaderAnnotationCommentToolWithApi(apiClient, name, args = {}, options = {}) {
+  const fields = name === 'read_reader_annotation_comment'
+    ? ['library', 'annotationKey', 'attachmentKey']
+    : name === 'update_reader_annotation_comment'
+      ? ['library', 'annotationKey', 'attachmentKey', 'expectedVersion', 'expectedComment', 'comment', 'editToken']
+      : null;
+  if (!fields) throw new Error(`不支持的批注备注操作：${name}`);
+  const actual = Object.keys(args).sort();
+  if (actual.join(',') !== [...fields].sort().join(','))
+    throw new Error(`${name} 参数不符合批注身份与版本保护契约。`);
+  if (Object.keys(options).length > 0 && (name !== 'read_reader_annotation_comment' || options.readOnly !== true || Object.keys(options).length !== 1))
+    throw new Error('只读核对仅适用于读取当前批注备注。');
+  return apiClient.requestJson('/annotation-comment', {
+    method: 'POST',
+    body: { tool: name, args, ...(options.readOnly === true ? { readOnly: true } : {}) },
+  });
+}
+
 async function callResearchTool(name, args = {}) {
   return callResearchToolWithApi(api, name, args);
 }
@@ -2050,6 +2101,10 @@ function setupViewer() {
 }
 
 function openReader({ page = 0, attachmentKey = '' } = {}) {
+  if (state.annotationCommentEdit?.status === 'saving') {
+    toast('Zotero 备注写入请求仍在处理，请等待回执后再切换 PDF。', { tone: 'info' });
+    return Promise.resolve(null);
+  }
   const detail = state.detail;
   if (!detail || state.detailStatus !== 'ready') {
     toast('条目详情尚未加载完成', { tone: 'error' });
@@ -2134,6 +2189,10 @@ function openReader({ page = 0, attachmentKey = '' } = {}) {
 }
 
 function closeReader({ preserveCitationReveal = false } = {}) {
+  if (state.annotationCommentEdit?.status === 'saving') {
+    setAnnotationCommentStatus('Zotero 备注写入请求仍在处理；当前编辑器会保持打开。', 'info');
+    return;
+  }
   state.center = 'list';
   state.reader.open = false;
   // P1.2：角标定位流程自己管理浮层生命周期；只有用户主动关闭阅读视图时才 hide。
@@ -2245,14 +2304,266 @@ async function jumpToAnnotation(annotation, index = -1) {
 
 /* ============================== 批注浮层 ============================== */
 
+function resetAnnotationCommentEditor() {
+  state.annotationCommentRequest += 1;
+  state.annotationCommentEdit = null;
+  if (el.annCommentEditor) el.annCommentEditor.hidden = true;
+  if (el.annCommentInput) el.annCommentInput.value = '';
+  if (el.annCommentInput) el.annCommentInput.disabled = false;
+  if (el.annCommentObserved) el.annCommentObserved.hidden = true;
+  if (el.annCommentObservedText) el.annCommentObservedText.textContent = '';
+  if (el.annCommentReconcile) {
+    el.annCommentReconcile.hidden = true;
+    el.annCommentReconcile.disabled = false;
+  }
+  if (el.annCommentStatus) {
+    el.annCommentStatus.hidden = true;
+    el.annCommentStatus.textContent = '';
+    el.annCommentStatus.removeAttribute('data-tone');
+  }
+  if (el.annCommentSave) {
+    el.annCommentSave.disabled = false;
+    el.annCommentSave.hidden = false;
+  }
+  if (el.annCommentEditBtn) el.annCommentEditBtn.hidden = false;
+}
+
+function setAnnotationCommentStatus(message, tone = 'info') {
+  if (!el.annCommentStatus) return;
+  el.annCommentStatus.textContent = message;
+  el.annCommentStatus.dataset.tone = tone;
+  el.annCommentStatus.hidden = !message;
+}
+
+function showObservedAnnotationComment(comment) {
+  if (!el.annCommentObserved || !el.annCommentObservedText) return;
+  el.annCommentObservedText.textContent = comment || '（空备注）';
+  el.annCommentObserved.hidden = false;
+}
+
+function positionAnnotationPopover() {
+  if (!el.annPopover || el.annPopover.hidden) return;
+  const rect = el.annPopover.getBoundingClientRect();
+  const margin = 12;
+  const left = Math.min(Math.max(margin, Number.parseFloat(el.annPopover.style.left) || margin), Math.max(margin, window.innerWidth - rect.width - margin));
+  const top = Math.min(Math.max(margin, Number.parseFloat(el.annPopover.style.top) || margin), Math.max(margin, window.innerHeight - rect.height - margin));
+  el.annPopover.style.left = `${left}px`;
+  el.annPopover.style.top = `${top}px`;
+}
+
+function annotationCommentIdentity(annotation) {
+  const attachmentKey = String(annotation?.parentAttachment || state.reader.attachmentKey || '');
+  if (!annotation?.key || !attachmentKey || state.detailStatus !== 'ready' || !state.detail?.key)
+    return null;
+  return { library: 'user', annotationKey: String(annotation.key), attachmentKey };
+}
+
+function unwrapReaderCommentResult(result) {
+  return result?.structuredContent && typeof result.structuredContent === 'object'
+    ? result.structuredContent
+    : result;
+}
+
+async function beginAnnotationCommentEdit() {
+  const annotation = currentPopoverAnnotation();
+  const identity = annotationCommentIdentity(annotation);
+  if (!identity) {
+    setAnnotationCommentStatus('无法确认当前文献与 PDF 批注身份，请重新打开该批注。', 'error');
+    return;
+  }
+
+  const requestId = ++state.annotationCommentRequest;
+  state.annotationCommentEdit = { identity, status: 'loading', requestId, editToken: '' };
+  el.annCommentEditor.hidden = false;
+  el.annCommentEditBtn.hidden = true;
+  el.annCommentSave.disabled = true;
+  setAnnotationCommentStatus('正在读取当前备注与版本保护信息…');
+  positionAnnotationPopover();
+
+  try {
+    const result = await callReaderAnnotationCommentToolWithApi(api, 'read_reader_annotation_comment', identity);
+    const payload = unwrapReaderCommentResult(result);
+    const edit = state.annotationCommentEdit;
+    if (!edit || edit.requestId !== requestId || state.popoverAnnotationKey !== identity.annotationKey ||
+        state.reader.attachmentKey !== identity.attachmentKey) return;
+    if (!Number.isSafeInteger(payload?.annotationVersion) || payload.annotationVersion < 0 || typeof payload.comment !== 'string')
+      throw new Error('读取结果缺少有效的版本保护信息。');
+
+    edit.expectedVersion = payload.annotationVersion;
+    edit.expectedComment = payload.comment;
+    el.annCommentInput.value = payload.comment;
+    if (payload.editable !== true || typeof payload.editToken !== 'string' || !/^[a-f0-9]{48}$/.test(payload.editToken)) {
+      edit.status = 'blocked';
+      edit.editToken = '';
+      el.annCommentInput.disabled = true;
+      el.annCommentSave.disabled = true;
+      showObservedAnnotationComment(payload.comment);
+      const operationMessage = typeof payload.lastOperation?.message === 'string' ? payload.lastOperation.message : '';
+      const blockedMessage = typeof payload.editBlockedBy?.message === 'string' ? payload.editBlockedBy.message : '';
+      setAnnotationCommentStatus(operationMessage || blockedMessage || '当前备注可读取，但 Zotero 暂未开放安全编辑。', 'error');
+      if (['outcome-unknown', 'in-flight'].includes(payload.lastOperation?.status) || payload.editBlockedBy)
+        el.annCommentReconcile.hidden = false;
+      positionAnnotationPopover();
+      return;
+    }
+
+    edit.status = 'ready';
+    edit.editToken = payload.editToken;
+    el.annCommentSave.disabled = false;
+    setAnnotationCommentStatus('编辑当前 Zotero 批注的阅读者备注；保存后会回读核实。');
+    el.annCommentInput.focus();
+    positionAnnotationPopover();
+  } catch (error) {
+    const edit = state.annotationCommentEdit;
+    if (!edit || edit.requestId !== requestId) return;
+    edit.status = 'error';
+    edit.editToken = '';
+    el.annCommentSave.disabled = true;
+    setAnnotationCommentStatus(`无法读取备注：${error?.message || '服务错误'}。没有执行写入。`, 'error');
+    positionAnnotationPopover();
+  }
+}
+
+async function reconcileAnnotationCommentReadOnly() {
+  const edit = state.annotationCommentEdit;
+  if (!edit || !['unknown', 'blocked', 'reconciled-readonly'].includes(edit.status)) return;
+  if (state.popoverAnnotationKey !== edit.identity.annotationKey || state.reader.attachmentKey !== edit.identity.attachmentKey) return;
+  const requestId = ++state.annotationCommentRequest;
+  const draft = String(el.annCommentInput.value ?? '');
+  edit.reconcileRequestId = requestId;
+  el.annCommentInput.disabled = true;
+  el.annCommentReconcile.disabled = true;
+  setAnnotationCommentStatus('正在只读读取 Zotero 当前备注；草稿会保留，不会重发写入…');
+  try {
+    const result = await callReaderAnnotationCommentToolWithApi(api, 'read_reader_annotation_comment', edit.identity, { readOnly: true });
+    const payload = unwrapReaderCommentResult(result);
+    if (state.annotationCommentEdit !== edit || edit.reconcileRequestId !== requestId ||
+        state.popoverAnnotationKey !== edit.identity.annotationKey || state.reader.attachmentKey !== edit.identity.attachmentKey) return;
+    if (typeof payload?.comment !== 'string' || !Number.isSafeInteger(payload.annotationVersion))
+      throw new Error('只读回执缺少当前备注或版本信息。');
+
+    const annotation = currentPopoverAnnotation();
+    if (annotation) annotation.comment = payload.comment;
+    el.annComment.textContent = payload.comment;
+    el.annComment.hidden = !payload.comment;
+    el.annCommentEditBtn.textContent = payload.comment ? '编辑备注' : '添加备注';
+    showObservedAnnotationComment(payload.comment);
+    // 只读核对不接续写入授权。即使服务重新签发 editToken，也不会保存或使用。
+    edit.editToken = '';
+    edit.status = 'reconciled-readonly';
+    el.annCommentInput.value = draft;
+    el.annCommentInput.disabled = false;
+    el.annCommentSave.disabled = true;
+    const matchesSubmitted = typeof edit.submittedComment === 'string' && payload.comment === edit.submittedComment;
+    const comparison = typeof edit.submittedComment === 'string'
+      ? matchesSubmitted ? '当前备注与本次提交内容一致。' : '当前备注与本次提交内容不同。'
+      : '当前备注已读取。';
+    const operationMessage = typeof payload.lastOperation?.message === 'string' ? ` ${payload.lastOperation.message}` : '';
+    setAnnotationCommentStatus(`只读核对完成：${comparison}编辑器草稿已保留，没有再次写入。${operationMessage}`);
+    el.annCommentReconcile.disabled = false;
+    positionAnnotationPopover();
+  } catch (error) {
+    if (state.annotationCommentEdit !== edit || edit.reconcileRequestId !== requestId) return;
+    edit.status = 'unknown';
+    edit.editToken = '';
+    el.annCommentInput.value = draft;
+    el.annCommentInput.disabled = false;
+    el.annCommentSave.disabled = true;
+    el.annCommentReconcile.disabled = false;
+    setAnnotationCommentStatus(`只读核对失败，草稿仍保留：${error?.message || '读取服务错误'}。没有重发写入。`, 'error');
+    positionAnnotationPopover();
+  }
+}
+
+function cancelAnnotationCommentEdit() {
+  if (state.annotationCommentEdit?.status === 'saving') {
+    setAnnotationCommentStatus('备注保存请求仍在处理；请等待回执后再取消。当前草稿会保留。', 'info');
+    return;
+  }
+  resetAnnotationCommentEditor();
+  positionAnnotationPopover();
+}
+
+async function saveAnnotationComment() {
+  const edit = state.annotationCommentEdit;
+  if (!edit || edit.status !== 'ready' || !edit.editToken) return;
+  if (state.popoverAnnotationKey !== edit.identity.annotationKey || state.reader.attachmentKey !== edit.identity.attachmentKey) {
+    setAnnotationCommentStatus('当前批注已切换，已取消本次保存。请重新打开批注后编辑。', 'error');
+    cancelAnnotationCommentEdit();
+    return;
+  }
+
+  const requestId = edit.requestId;
+  const newComment = String(el.annCommentInput.value ?? '');
+  edit.status = 'saving';
+  edit.saveAttempted = true;
+  edit.submittedComment = newComment;
+  el.annCommentInput.disabled = true;
+  el.annCommentSave.disabled = true;
+  setAnnotationCommentStatus('正在保存备注并回读验证…');
+
+  try {
+    const result = await callReaderAnnotationCommentToolWithApi(api, 'update_reader_annotation_comment', {
+      ...edit.identity,
+      expectedVersion: edit.expectedVersion,
+      expectedComment: edit.expectedComment,
+      comment: newComment,
+      editToken: edit.editToken,
+    });
+    const payload = unwrapReaderCommentResult(result);
+    if (state.annotationCommentEdit !== edit || state.popoverAnnotationKey !== edit.identity.annotationKey ||
+        state.reader.attachmentKey !== edit.identity.attachmentKey) {
+      toast('备注保存请求已发出，但批注浮层已切换；未自动重试，请重新打开批注只读核对。', { tone: 'error' });
+      return;
+    }
+    edit.editToken = '';
+    if (payload?.verified === true) {
+      const annotation = currentPopoverAnnotation();
+      const savedComment = typeof payload.comment === 'string' ? payload.comment : newComment;
+      if (annotation) annotation.comment = savedComment;
+      el.annComment.textContent = savedComment;
+      el.annComment.hidden = !savedComment;
+      el.annCommentEditBtn.textContent = savedComment ? '编辑备注' : '添加备注';
+      edit.status = 'verified';
+      resetAnnotationCommentEditor();
+      renderDetail();
+      toast('备注已保存并回读核实', { tone: 'info' });
+      return;
+    }
+    edit.status = 'unknown';
+    el.annCommentSave.disabled = true;
+    el.annCommentInput.disabled = false;
+    el.annCommentReconcile.hidden = false;
+    setAnnotationCommentStatus(typeof payload?.message === 'string'
+      ? `${payload.message} 草稿已保留，可在此只读核对；系统没有重试。`
+      : '保存结果尚未核实；草稿已保留，可在此只读核对。系统没有重试。', 'error');
+    positionAnnotationPopover();
+  } catch (error) {
+    if (state.annotationCommentEdit !== edit || requestId !== edit.requestId) return;
+    edit.status = 'unknown';
+    edit.editToken = '';
+    el.annCommentSave.disabled = true;
+    el.annCommentInput.disabled = false;
+    el.annCommentReconcile.hidden = false;
+    setAnnotationCommentStatus(`保存结果尚未核实：${error?.message || '服务错误'}。草稿已保留，可在此只读核对；系统没有重试。`, 'error');
+    positionAnnotationPopover();
+  }
+}
+
 function showAnnotationPopover(annotation, event) {
   if (!el.annPopover) return;
+  if (state.annotationCommentEdit?.status === 'saving') {
+    setAnnotationCommentStatus('备注保存请求仍在处理；当前批注浮层保持打开。', 'info');
+    return;
+  }
+  resetAnnotationCommentEditor();
   state.popoverAnnotationKey = annotation.key;
   el.annColor.style.background = annotation.color;
   el.annPage.textContent = `第 ${annotation.pageLabel || String((annotation.pageIndex ?? 0) + 1)} 页`;
   el.annQuote.textContent = annotation.text || '（无原文）';
   el.annComment.textContent = annotation.comment || '';
   el.annComment.hidden = !annotation.comment;
+  el.annCommentEditBtn.textContent = annotation.comment ? '编辑备注' : '添加备注';
   el.annTags.innerHTML = annotation.tags
     .map((tag) => `<span class="ws-tag">${escapeHtml(tag)}</span>`)
     .join('');
@@ -2277,6 +2588,11 @@ function showAnnotationPopover(annotation, event) {
 }
 
 function hideAnnotationPopover() {
+  if (state.annotationCommentEdit?.status === 'saving') {
+    setAnnotationCommentStatus('备注保存请求仍在处理；当前编辑器会保持打开。', 'info');
+    return;
+  }
+  resetAnnotationCommentEditor();
   if (el.annPopover) el.annPopover.hidden = true;
   state.popoverAnnotationKey = '';
 }
@@ -2607,6 +2923,18 @@ function bindEvents() {
         break;
       case 'ann-close':
         hideAnnotationPopover();
+        break;
+      case 'ann-comment-edit':
+        void beginAnnotationCommentEdit();
+        break;
+      case 'ann-comment-cancel':
+        cancelAnnotationCommentEdit();
+        break;
+      case 'ann-comment-save':
+        void saveAnnotationComment();
+        break;
+      case 'ann-comment-reconcile':
+        void reconcileAnnotationCommentReadOnly();
         break;
       case 'ann-open-zotero': {
         const annotation = currentPopoverAnnotation();
